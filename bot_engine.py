@@ -57,6 +57,7 @@ import symbols as sym_module
 import strategy_stats
 import meta_labeling
 import pair_suspension
+import target_guard
 from deriv_client import DerivClient
 from candlestick_builder import CandlestickBuilder
 from smc_analyzer import SMCAnalyzer, SMCContext
@@ -571,6 +572,8 @@ class BotEngine:
 
     def _on_balance(self, balance: float):
         self.risk.set_balance(balance)
+        # Balance target: at/above TARGET_BALANCE -> no more trades, service suspended.
+        target_guard.check_balance(balance)
         # No balance-driven cycle logic anymore — fixed_cycle.py's
         # single-leg-then-cooldown pattern is purely time-based (see
         # _settle_loop's redeploy-pending handling), not balance-,
@@ -598,6 +601,19 @@ class BotEngine:
 
         self.client.on_balance(self._on_balance)
         self.risk.set_balance(self.client.balance)
+
+        # ── Balance-target guard (TARGET_BALANCE), checked at every boot ──────
+        if target_guard.target() is None:
+            logger.info("TARGET GUARD: TARGET_BALANCE not set - no balance target")
+        else:
+            logger.info("TARGET GUARD: target=%.2f  live balance=%.2f",
+                        target_guard.target(), self.client.balance)
+            target_guard.check_balance(self.client.balance)
+            if target_guard.is_reached():
+                logger.warning("TARGET GUARD: balance already at/above target - "
+                               "not trading; the service is being suspended")
+                ws_task.cancel()
+                return
 
         self._day_start_balance     = self.client.balance
         self._session_start_balance = self.client.balance
@@ -651,6 +667,7 @@ class BotEngine:
         dash_task     = asyncio.create_task(self._dashboard_loop())
         settle_task   = asyncio.create_task(self._settle_loop())
         degraded_task = asyncio.create_task(self._degraded_retry_loop())
+        target_task   = asyncio.create_task(self._target_monitor_loop())
         # NOTE: the daily Kenya-midnight redeploy timer (Fix G) is started
         # by main.py's existing restart_scheduler.start_restart_scheduler()
         # call, unchanged — NOT started again here, to avoid two competing
@@ -670,7 +687,24 @@ class BotEngine:
             dash_task.cancel()
             settle_task.cancel()
             degraded_task.cancel()
+            target_task.cancel()
             ws_task.cancel()
+
+    async def _target_monitor_loop(self):
+        """Safety net beside the balance stream: poll Deriv's live balance directly
+        every TARGET_CHECK_SECONDS and stop as soon as it is at/above the target."""
+        while not target_guard.is_reached():
+            await asyncio.sleep(target_guard.check_seconds())
+            if target_guard.target() is None or not self.client.is_connected:
+                continue
+            try:
+                resp = await self.client._send({"balance": 1}, timeout=10)
+                bal = float(resp.get("balance", {}).get("balance", self.client.balance))
+                target_guard.check_balance(bal)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("target monitor: balance poll failed: %s", exc)
 
     # ── Deliberate disconnect ahead of restart + clear-cache redeploy ──────────
 
@@ -1362,7 +1396,8 @@ class BotEngine:
                 in_loss_streak_pause = True
 
             top: List[ScanResult] = []
-            if available_slots > 0 and not self._confirmed_paused and not in_loss_streak_pause:
+            if (available_slots > 0 and not self._confirmed_paused and not in_loss_streak_pause
+                    and not target_guard.is_reached()):
                 for r in ranked:
                     if len(top) >= available_slots:
                         break
