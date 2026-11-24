@@ -951,6 +951,25 @@ POPULAR_HURST_MIN_BARS      = 40
 MANUAL_STAKE_MODE   = True
 MANUAL_STAKE_AMOUNT = 0.5
 
+# STAKE FROM ENVIRONMENT: set STAKE_AMOUNT (or PREDICTOR_STAKE) on Render to a
+# fixed stake per trade, e.g. STAKE_AMOUNT=1669. When set (> 0) it overrides the
+# balance-tier table and MANUAL_STAKE_AMOUNT below. Unset / 0 / not a number ->
+# the balance-tier stake is used as before. Restart the service after changing it.
+def _env_stake():
+    for _name in ("STAKE_AMOUNT", "PREDICTOR_STAKE"):
+        _raw = (os.environ.get(_name) or "").strip().replace(",", "").lstrip("$")
+        if not _raw:
+            continue
+        try:
+            _val = float(_raw)
+        except ValueError:
+            continue
+        if _val > 0:
+            return _val
+    return None
+
+STAKE_AMOUNT = _env_stake()
+
 # BALANCE-TIER STAKING (Sep 2026, chat-requested): stake follows the account
 # balance band table in balance_tiers.py ($0.35 up to $8 ... $2,000 from
 # $36,500 to $50,000). Takes priority over MANUAL_STAKE_MODE while True.
