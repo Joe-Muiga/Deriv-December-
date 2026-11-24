@@ -159,6 +159,8 @@ if __name__ == "__main__":
                     f"follower token {'SET ✓' if os.environ.get('DERIV_FOLLOWER_TOKEN') else 'missing'}"
                     f" | dashboard: /sf/view")
 
+    import target_guard
+    logger.info(f"  Balance target: {target_guard.target() if target_guard.target() else 'OFF (TARGET_BALANCE not set)'}")
     logger.info(f"  Redeploy leg : {config.REDEPLOY_INTERVAL_SECS}s strict, never-ending | "
                 f"fixed cycle {'ON' if config.FIXED_CYCLE_ENABLED else 'OFF (no cooldowns)'} | "
                 f"gate {config.GATE_MODE} | ML {'on' if config.ML_ENABLED else 'off'}")

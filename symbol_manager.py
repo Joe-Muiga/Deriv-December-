@@ -41,6 +41,8 @@ class SymbolManager:
         self.current_session = "Active"
 
     def suspend(self, symbol: str, minutes: float) -> None:
+        if minutes <= 0:          # suspensions removed
+            return
         until = time.time() + (minutes * 60)
         self._suspension_until[symbol] = until
         logger.info(

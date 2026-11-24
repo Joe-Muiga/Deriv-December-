@@ -63,6 +63,8 @@ def maybe_suspend(strategy: str, symbol: str) -> None:
     if is_suspended(strategy, symbol):
         return
     minutes = getattr(config, "PAIR_SUSPEND_MINUTES", 60)
+    if minutes <= 0:          # suspensions removed
+        return
     _suspended_until[(strategy, symbol)] = time.time() + minutes * 60
     logger.info(
         f"PAIR SUSPENDED: {strategy}/{symbol} for {minutes}min "
