@@ -302,6 +302,22 @@ class _StrategyExpectancyTracker:
 
 # ─── Bot engine ────────────────────────────────────────────────────────────────
 
+def _flip_digit_trade(match_type, digit):
+    """FLIP_TRADES mirror image of an OVER/UNDER digit trade, or None if it can't be
+    flipped. OVER b wins on digits b+1..9 (9-b of them); UNDER (9-b) wins on digits
+    0..8-b (also 9-b of them), so win probability and payout are unchanged."""
+    try:
+        d = int(digit)
+    except (TypeError, ValueError):
+        return None
+    mt = str(match_type or "").upper()
+    if mt == "OVER" and 0 <= d <= 8:
+        return "UNDER", 9 - d
+    if mt == "UNDER" and 1 <= d <= 9:
+        return "OVER", 9 - d
+    return None
+
+
 class BotEngine:
 
     def __init__(self):
@@ -2222,6 +2238,22 @@ class BotEngine:
         if getattr(sig, "contract_kind", "RISE_FALL") == "DIGIT":
             digit = getattr(sig, "digit", None)
             match_type = getattr(sig, "match_type", None)
+            # FLIP_TRADES: take the mirror-image side (same win probability and
+            # payout). The signal itself is updated so every record downstream
+            # (open-contract log, results) matches what was actually bought.
+            if (getattr(config, "FLIP_TRADES", False)
+                    and not getattr(sig, "_flipped", False)):
+                _flip = _flip_digit_trade(match_type, digit)
+                if _flip is not None:
+                    logger.warning(
+                        f"FLIP TRADES: {symbol} {match_type} {digit} -> "
+                        f"{_flip[0]} {_flip[1]}")
+                    match_type, digit = _flip
+                    sig.match_type, sig.digit = match_type, digit
+                    sig._flipped = True
+                else:
+                    logger.info(f"FLIP TRADES: {symbol} {match_type} {digit} "
+                                f"cannot be mirrored - placed as-is")
             if digit is None or match_type is None:
                 logger.warning(
                     f"PLACEMENT SKIPPED: {symbol} DIGIT signal missing "

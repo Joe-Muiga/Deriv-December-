@@ -970,6 +970,13 @@ def _env_stake():
 
 STAKE_AMOUNT = _env_stake()
 
+# FLIP TRADES: set FLIP_TRADES=1 on Render to make the bot take the mirror-image
+# side of every digit trade it would otherwise place. OVER b <-> UNDER (9-b):
+# the win probability and the payout stay exactly the same, only the side
+# changes (e.g. OVER 6 -> UNDER 3, both ~30% to win). Off by default. Restart
+# the service after changing it.
+FLIP_TRADES = (os.environ.get("FLIP_TRADES", "0").strip().lower() in ("1", "true", "yes", "on"))
+
 # BALANCE-TIER STAKING (Sep 2026, chat-requested): stake follows the account
 # balance band table in balance_tiers.py ($0.35 up to $8 ... $2,000 from
 # $36,500 to $50,000). Takes priority over MANUAL_STAKE_MODE while True.

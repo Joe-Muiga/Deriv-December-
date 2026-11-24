@@ -160,6 +160,7 @@ if __name__ == "__main__":
                     f" | dashboard: /sf/view")
 
     import target_guard
+    logger.info(f"  Flip trades   : {'ON (mirror-image side of every digit trade)' if config.FLIP_TRADES else 'OFF'}")
     logger.info(f"  Balance target: {target_guard.target() if target_guard.target() else 'OFF (TARGET_BALANCE not set)'}")
     logger.info(f"  Redeploy leg : {config.REDEPLOY_INTERVAL_SECS}s strict, never-ending | "
                 f"fixed cycle {'ON' if config.FIXED_CYCLE_ENABLED else 'OFF (no cooldowns)'} | "
