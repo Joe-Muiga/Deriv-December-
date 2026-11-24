@@ -862,7 +862,7 @@ SCALED_SL_TARGET_MULT         = 0.35   # was 0.60
 # flat, non-renewing clock this many minutes long. Only that pair sits out;
 # every other indicator keeps trading that symbol, and this indicator keeps
 # trading every other symbol. See pair_suspension.py.
-PAIR_SUSPEND_MINUTES = 60
+PAIR_SUSPEND_MINUTES = 0  # REMOVED PER REQUEST - pauses/suspensions off
 
 # ── POPULAR INDICATOR CONFLUENCE STRATEGY (user-directed, Aug 2026) ──────
 # Replaces the strategy used to trade every symbol in MULTIPLIER_SYMBOLS
@@ -984,7 +984,7 @@ BALANCE_TIER_STAKE_MODE = True
 # same RENDER_API_KEY/RENDER_SERVICE_ID as fixed_cycle.py).
 # TARGET_BASIS: "start" = tier of the session's starting balance fixes the
 # target; "current" = tier of the live balance is used on every check.
-PROFIT_PAUSE_ENABLED      = True
+PROFIT_PAUSE_ENABLED      = False  # REMOVED PER REQUEST - pauses/suspensions off
 PROFIT_PAUSE_MIN_MINUTES  = 11   # pause length is drawn uniformly at random
 PROFIT_PAUSE_MAX_MINUTES  = 18   # between these (was a fixed 45)
 PROFIT_PAUSE_TARGET_BASIS = "start"
@@ -1033,7 +1033,7 @@ DAILY_LOSS_LIMIT_PCT = float("inf")  # REMOVED PER REQUEST — was 0.06 (6%).
                                 # so trading is never auto-paused on daily loss.
                                 # DAILY_LOSS_PAUSE_MINS below is now unused —
                                 # nothing left to trigger a pause to time out.
-DAILY_LOSS_PAUSE_MINS = 30
+DAILY_LOSS_PAUSE_MINS = 0  # REMOVED PER REQUEST - pauses/suspensions off
 
 # FIX (profitability audit, round 2): global, account-wide circuit breaker —
 # pause ALL new entries (any symbol/strategy) after this many consecutive
@@ -1189,7 +1189,7 @@ RECONCILE_MAX_SECS           = 1800   # 30 min — far longer than any real
 MULTIPLIER_MAX_HOLD_MINS = 30
 
 # ── SYMBOL SUSPENSION (minutes) ──────────────────────────────
-SYMBOL_WIN_SUSPEND_MINS   = 30     # was 20 — increased by 10min per user request
+SYMBOL_WIN_SUSPEND_MINS   = 0  # REMOVED PER REQUEST - pauses/suspensions off
 SYMBOL_MIN_GAP_MINS       = 1
 
 # Escalating per-symbol loss suspension ladder (Implementation Brief v2,
@@ -1200,7 +1200,7 @@ SYMBOL_MIN_GAP_MINS       = 1
 # restart) — never by a UTC-midnight or other calendar boundary.
 # Replaces the old flat SYMBOL_LOSS_SUSPEND_MINS / SYMBOL_SESSION_BAN_LOSSES
 # (59,940-minute "session ban") scheme entirely.
-SESSION_LOSS_SUSPEND_LADDER_MINS = [70, 130, 190, 250]  # was [60,120,180,240] — +10min per tier per user request
+SESSION_LOSS_SUSPEND_LADDER_MINS = [0, 0, 0, 0]  # REMOVED PER REQUEST - pauses/suspensions off
 
 # ── RAW TICK BUFFER (feeds tick-based evaluators via evaluate(ticks=...)) ──
 TICK_BUFFER_MAXLEN = 200
@@ -1278,7 +1278,7 @@ DAILY_LOSS_LIMIT   = DAILY_LOSS_LIMIT_PCT    # alias
 MIN_MODULES_FOR_SIGNAL     = 3
 MIN_INDICATOR_VOTES        = 3
 OB_EXPIRY_BARS             = 100
-NEWS_BLOCK_MINUTES         = 60
+NEWS_BLOCK_MINUTES         = 0  # REMOVED PER REQUEST - pauses/suspensions off
 FOREX_LTF_GRANULARITY      = 900
 OTHER_LTF_GRANULARITY      = 60
 MIN_SIGNAL_PROBABILITY     = 1.8
@@ -1874,7 +1874,7 @@ DONKEY_MIN_PAYOUT_RATIO = 2.0   # ON again (Sep 28 2026, chat-requested:
 # Stops are in units of your fixed stake, so they scale with MANUAL_STAKE_AMOUNT.
 # State is saved at the end of every leg (fixed_cycle.enter_cooldown_now) so
 # it survives the redeploy between legs.
-DONKEY_GUARD_ENABLED                     = True
+DONKEY_GUARD_ENABLED                     = False  # REMOVED PER REQUEST - pauses/suspensions off
 # Sep 2026: thresholds now come from balance_tiers.py by stake/account range
 # (stop-loss 9 -> 5 stakes, loss streak 7 -> 5). The flat values below are
 # only the fallback when DONKEY_GUARD_TIERED = False. Take-profit is handled

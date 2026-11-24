@@ -1268,7 +1268,7 @@ class DerivClient:
             take_profit:   float  = None,
             strategy:      str    = "default",
             cb_threshold:  int    = 3,
-            cb_cooldown:   float  = 60.0,
+            cb_cooldown:   float  = 0.0,
             **kwargs) -> dict:
         """
         Buy a Rise/Fall (CALL/PUT) contract via the required proposal ->
@@ -1429,7 +1429,7 @@ class DerivClient:
             take_profit_ratio: float = None,
             strategy:      str    = "default",
             cb_threshold:  int    = 3,
-            cb_cooldown:   float  = 60.0,
+            cb_cooldown:   float  = 0.0,
             stop_loss_price:   float = None,
             take_profit_price: float = None,
             entry_price:       float = None,
