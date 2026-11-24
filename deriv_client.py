@@ -145,7 +145,6 @@ import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 import config
-import target_guard
 
 # Deriv's newer Options trading API (REST for account/OTP setup, WS for trading).
 # Replaces the legacy wss://ws.derivws.com/websockets/v3?app_id=... endpoint,
@@ -154,28 +153,14 @@ _OPTIONS_API_BASE = "https://api.derivws.com/trading/v1/options"
 
 logger = logging.getLogger(__name__)
 
-
-def is_confirmed_close(poc) -> bool:
-    """True only when Deriv reports the contract as genuinely SETTLED:
-    is_sold == 1, or status won/lost/sold. A bare is_expired flag is NOT
-    enough: an expired digit contract can still report status "open" with
-    profit == -stake (the stake has left the balance, the payout hasn't
-    been credited yet) for a few ticks before it settles as a win."""
-    if not poc:
-        return False
-    if poc.get("is_sold"):
-        return True
-    return str(poc.get("status", "")).lower() in ("won", "lost", "sold")
-
-
 MAX_RETRY_DELAY = 60
 
 _BOOM_CRASH_PREFIXES = ("BOOM", "CRASH")
 _VOLATILITY_PREFIXES = ("R_", "1HZ")
 
 # ── Reconnect defaults (overridden by config if present) ──────────────────────
-_DEFAULT_RECONNECT_INTERVAL = 5   # seconds between retries
-_DEFAULT_MAX_RECONNECTS     = 10  # 0 = unlimited
+_DEFAULT_RECONNECT_INTERVAL = 3   # base seconds between retries (exponential backoff, cap MAX_RETRY_DELAY)
+_DEFAULT_MAX_RECONNECTS     = 0   # 0 = unlimited: never give up reconnecting
 
 # Contract polling interval in seconds
 _CONTRACT_POLL_INTERVAL = 30
@@ -195,16 +180,7 @@ def _is_volatility_index(symbol: str) -> bool:
 
 class DerivClient:
 
-    def __init__(self, token: Optional[str] = None,
-                 app_id: Optional[str] = None,
-                 account_mode: Optional[str] = None):
-        # Oct 2026 (Scout+Follower): credentials can be passed per instance so
-        # a second client (the Follower) can use its own token. All default to
-        # the config values, so existing single-client behaviour is unchanged.
-        # The token is never logged.
-        self._token        = token if token is not None else config.DERIV_API_TOKEN
-        self._app_id       = app_id if app_id is not None else config.DERIV_APP_ID
-        self._account_mode = account_mode
+    def __init__(self):
         self._ws: Optional[Any]    = None
         self._ready: asyncio.Event = asyncio.Event()
         self._connected: bool      = False
@@ -222,6 +198,7 @@ class DerivClient:
         self._balance: float             = 0.0
         self._balance_ts: float          = 0.0          # epoch of last successful fetch
         self._balance_callbacks: List[Callable] = []
+        self._stopped: bool              = False        # set by shutdown(): never reconnect again
 
         # ── Polling-based contract resolution ──────────────────────────────────
         # {contract_id: {"callback": fn, "placed_at": time}}
@@ -231,6 +208,10 @@ class DerivClient:
         self._subscribed_contracts: set = set()
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # Incremented on every successful (re)connect so the engine can tell that
+        # ticks may have been missed and re-sync its predictor.
+        self._conn_count: int = 0
 
         # ── Rate limiting ─────────────────────────────────────────────────────
         self._buy_semaphore  = asyncio.Semaphore(1)  # one at a time
@@ -260,10 +241,9 @@ class DerivClient:
         Returns the ready-to-connect wss:// URL. OTPs are short-lived, so this
         must be called fresh on every (re)connect attempt — never cache the URL.
         """
-        app_id = self._app_id
-        token  = self._token
-        mode   = (self._account_mode
-                  or getattr(config, "DERIV_ACCOUNT_MODE", "demo")).strip().lower()
+        app_id = config.DERIV_APP_ID
+        token  = config.DERIV_API_TOKEN
+        mode   = getattr(config, "DERIV_ACCOUNT_MODE", "demo").strip().lower()
 
         if not app_id:
             raise ValueError("DERIV_APP_ID is not set.")
@@ -279,7 +259,8 @@ class DerivClient:
             "Authorization": f"Bearer {token}",
         }
 
-        async with aiohttp.ClientSession() as session:
+        # Hard timeout: without it a stalled REST call can hang the reconnect loop for minutes.
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
             # Step 1 — list accounts
             async with session.get(
                 f"{_OPTIONS_API_BASE}/accounts", headers=headers
@@ -370,8 +351,11 @@ class DerivClient:
         )
         attempt   = 0
         max_label = str(max_reconnects) if max_reconnects > 0 else "∞"
+        connected_at = 0.0
 
         while True:
+            connected_at = 0.0
+            attempt_start = attempt
             try:
                 ws_url = await self._fetch_otp_ws_url()
                 logger.info(f"Connecting to {self._mask_otp(ws_url)} …")
@@ -383,7 +367,8 @@ class DerivClient:
                 ) as ws:
                     self._ws        = ws
                     self._connected = True
-                    attempt         = 0          # reset on successful connection
+                    connected_at    = time.monotonic()
+                    self._conn_count += 1
                     logger.info("WebSocket connected ✓")
 
                     # The OTP embedded in ws_url already authenticated this
@@ -447,7 +432,22 @@ class DerivClient:
                 self._connected  = False
                 self._authorized = False
                 self._ws         = None
+                # Fail in-flight requests immediately instead of leaving them to time out.
+                for _fut in list(self._pending.values()):
+                    if not _fut.done():
+                        _fut.set_exception(ConnectionError("WebSocket disconnected"))
                 self._pending.clear()
+
+            if self._stopped:
+                logger.warning("WebSocket shut down on purpose - reconnect loop ended")
+                return
+
+            # A connection that stayed up for a while counts as healthy -> reset backoff.
+            # One that died within seconds keeps backing off (avoids hammering OTP/REST).
+            if connected_at and time.monotonic() - connected_at >= 30:
+                attempt = 0
+            elif connected_at and attempt == attempt_start:
+                attempt += 1      # short-lived clean close: still back off a little
 
             if max_reconnects > 0 and attempt >= max_reconnects:
                 logger.critical(
@@ -457,7 +457,51 @@ class DerivClient:
                     f"WebSocket failed after {max_reconnects} reconnect attempts."
                 )
 
-            await asyncio.sleep(reconnect_interval)
+            delay = min(MAX_RETRY_DELAY, reconnect_interval * (2 ** min(max(attempt - 1, 0), 5)))
+            logger.info(f"Reconnecting in {delay:.0f}s (backoff step {attempt})")
+            await asyncio.sleep(delay)
+
+    async def force_reconnect(self, reason: str = "") -> None:
+        """Close the current socket; connect()'s loop then re-establishes it from scratch
+        (fresh OTP, balance, contract and tick subscriptions)."""
+        ws = self._ws
+        logger.warning(f"FORCE RECONNECT requested{': ' + reason if reason else ''}")
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception as exc:
+                logger.debug(f"force_reconnect close error: {exc}")
+
+    async def shutdown(self, reason: str = "") -> None:
+        """Close the socket and keep it closed (connect()'s loop exits instead of reconnecting)."""
+        self._stopped = True
+        logger.warning(f"DERIV CLIENT SHUTDOWN{': ' + reason if reason else ''}")
+        ws = self._ws
+        if ws is not None:
+            try:
+                await asyncio.wait_for(ws.close(), timeout=5)
+            except Exception as exc:
+                logger.debug(f"shutdown close error: {exc}")
+
+    async def fetch_balance_live(self, timeout: float = 8.0) -> float:
+        """Ask Deriv for the balance RIGHT NOW (no cache), update the cached value and fire
+        the balance callbacks. Raises if not connected / on error."""
+        resp = await self._send({"balance": 1}, timeout=timeout)
+        new_bal = float(resp.get("balance", {}).get("balance", self._balance))
+        if new_bal != self._balance:
+            logger.info(f"Balance poll: ${self._balance:.4f} -> ${new_bal:.4f}")
+        self._balance = new_bal
+        self._balance_ts = time.monotonic()
+        for cb in self._balance_callbacks:
+            try:
+                cb(self._balance)
+            except Exception:
+                pass
+        return self._balance
+
+    @property
+    def connection_count(self) -> int:
+        return self._conn_count
 
     # ─── Message dispatch ─────────────────────────────────────────────────────
 
@@ -524,7 +568,9 @@ class DerivClient:
         if msg_type == "proposal_open_contract":
             poc = msg.get("proposal_open_contract", {})
             cid = str(poc.get("contract_id", ""))
-            closed = is_confirmed_close(poc)
+            closed = bool(
+                poc.get("is_sold") or poc.get("is_expired") or poc.get("status") == "sold"
+            )
             if cid and closed:
                 info = self._polling_contracts.get(cid)
                 self.stop_tracking(cid)
@@ -553,6 +599,8 @@ class DerivClient:
         """
         while True:
             await asyncio.sleep(_CONTRACT_POLL_INTERVAL)
+            if self._stopped:
+                return
             # Task 2 observability requirement — cheap, always logged
             # (regardless of whether there's anything to poll) so tracking-
             # set sizes are visible on a predictable cadence rather than
@@ -565,7 +613,7 @@ class DerivClient:
             for cid in list(self._polling_contracts.keys()):
                 try:
                     result = await self.force_check_contract(cid)
-                    if is_confirmed_close(result):
+                    if result.get("is_sold") or result.get("is_expired") or result.get("status") == "sold":
                         info = self._polling_contracts.get(cid)
                         self.stop_tracking(cid)
                         if info and info.get("callback"):
@@ -846,6 +894,13 @@ class DerivClient:
     # ─── Request helper ───────────────────────────────────────────────────────
 
     async def _send(self, payload: dict, timeout: float = 30.0) -> dict:
+        if self._stopped:
+            raise RuntimeError("Client shut down")
+        if "buy" in payload or "proposal" in payload:
+            # Balance-target guard: once TARGET_BALANCE is hit nothing new may be priced or bought.
+            import target_guard
+            if target_guard.is_reached():
+                raise RuntimeError("TARGET_REACHED: trading stopped, order not sent")
         if not self._ws or not self._connected:
             raise RuntimeError("Not connected")
 
@@ -856,7 +911,11 @@ class DerivClient:
         fut = self._loop.create_future()
         self._pending[req_id] = fut
 
-        await self._ws.send(json.dumps(payload))
+        try:
+            await self._ws.send(json.dumps(payload))
+        except Exception:
+            self._pending.pop(req_id, None)
+            raise
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
@@ -866,10 +925,10 @@ class DerivClient:
     # ─── Auth & balance ───────────────────────────────────────────────────────
 
     async def _authorize(self):
-        if not self._token:
+        if not config.DERIV_API_TOKEN:
             raise ValueError("DERIV_API_TOKEN is not set.")
 
-        payload = {"authorize": self._token, "req_id": 1}
+        payload = {"authorize": config.DERIV_API_TOKEN, "req_id": 1}
         await self._ws.send(json.dumps(payload))
         raw = await asyncio.wait_for(self._ws.recv(), timeout=30)
         msg = json.loads(raw)
@@ -1022,6 +1081,51 @@ class DerivClient:
             )
             return []
 
+    # ─── Historical ticks (digit predictor warm-up) ───────────────────────────
+
+    async def get_tick_history(self, symbol: str, count: int = 5000) -> List[dict]:
+        """Latest `count` ticks as [{"epoch": int, "quote": float}], oldest first.
+        Deriv returns only ~1000 ticks per call, so older pages are fetched backwards
+        (end = oldest epoch - 1) until `count` is reached or no more come back.
+        Returns [] if even the first page fails; a failed older page just ends paging."""
+        await self._ready.wait()
+        page = max(100, int(getattr(config, "TICK_HISTORY_PAGE_SIZE", 1000)))
+        want = int(count)
+        by_epoch: Dict[int, float] = {}
+        end: Any = "latest"
+        for page_no in range(max(2, -(-want // page) + 2)):
+            req = {"ticks_history": symbol, "count": min(page, max(want - len(by_epoch), 1)),
+                   "end": end, "style": "ticks"}
+            if page_no == 0:
+                req["adjust_start_time"] = 1
+            try:
+                resp = await self._send(req, timeout=30)
+            except Exception as exc:
+                logger.warning(f"TICK HISTORY FAILED: {symbol} page={page_no} count={count} | error={exc}")
+                break
+            h = resp.get("history", {}) or {}
+            before = len(by_epoch)
+            for t, p in zip(h.get("times", []), h.get("prices", [])):
+                by_epoch[int(t)] = float(p)
+            if len(by_epoch) >= want or len(by_epoch) == before:
+                break
+            end = min(by_epoch) - 1
+        ordered = sorted(by_epoch.items())[-want:]
+        return [{"epoch": e, "quote": q} for e, q in ordered]
+
+    async def refresh_ticks(self, symbol: str, callback: Callable[[dict], None]) -> bool:
+        """Drop and re-create one live tick subscription (used when a stream goes quiet
+        while the socket itself still looks healthy). Returns True on success."""
+        old = self._subscription_map.pop(symbol, None)
+        if old:
+            try:
+                await self._send({"forget": old}, timeout=10)
+            except Exception as exc:
+                logger.debug(f"forget({old}) failed: {exc}")
+        self._tick_callbacks.pop(symbol, None)
+        sub_id = await self.subscribe_ticks(symbol, callback)
+        return bool(sub_id)
+
     # ─── Live tick subscription ───────────────────────────────────────────────
 
     async def subscribe_ticks(
@@ -1113,8 +1217,6 @@ class DerivClient:
         is what actually guards against a bad value reaching the API in
         that case, not this method.
         """
-        if getattr(config, "STAKE_AMOUNT", None):
-            return stake        # stake fixed by the STAKE_AMOUNT env var: send it as set
         balance = self._balance or 0.0
         if balance > 0 and stake > balance * 0.5:
             floor  = getattr(config, "MIN_STAKE", 0.35)
@@ -1195,8 +1297,7 @@ class DerivClient:
 
     @staticmethod
     def _digit_contract_type(match_type: str) -> Optional[str]:
-        # OVER/UNDER added for Donkey Strategy (signal_engine.
-        # evaluate_donkey_strategy()) — reuses the exact same match_type/
+        # OVER/UNDER support (digit predictor) — reuses the exact same match_type/
         # digit plumbing get_digit_proposal()/buy_digit_contract() already
         # had for MATCH/DIFFER, no signature changes needed.
         mapping = {
@@ -1268,7 +1369,7 @@ class DerivClient:
             take_profit:   float  = None,
             strategy:      str    = "default",
             cb_threshold:  int    = 3,
-            cb_cooldown:   float  = 0.0,
+            cb_cooldown:   float  = 60.0,
             **kwargs) -> dict:
         """
         Buy a Rise/Fall (CALL/PUT) contract via the required proposal ->
@@ -1312,10 +1413,6 @@ class DerivClient:
             if elapsed < 3.0:
                 await asyncio.sleep(3.0 - elapsed)
             self._last_buy_time = time.time()
-            # Balance-target guard: once TARGET_BALANCE is hit nothing may be priced or bought.
-            if target_guard.is_reached():
-                logger.warning("TARGET REACHED: order not sent - trading stopped")
-                return None
 
             contract_type = "CALL" if direction == "LONG" else "PUT"
 
@@ -1429,7 +1526,7 @@ class DerivClient:
             take_profit_ratio: float = None,
             strategy:      str    = "default",
             cb_threshold:  int    = 3,
-            cb_cooldown:   float  = 0.0,
+            cb_cooldown:   float  = 60.0,
             stop_loss_price:   float = None,
             take_profit_price: float = None,
             entry_price:       float = None,
@@ -1529,10 +1626,6 @@ class DerivClient:
             if elapsed < 3.0:
                 await asyncio.sleep(3.0 - elapsed)
             self._last_buy_time = time.time()
-            # Balance-target guard: once TARGET_BALANCE is hit nothing may be priced or bought.
-            if target_guard.is_reached():
-                logger.warning("TARGET REACHED: order not sent - trading stopped")
-                return None
 
             stake = self._cap_stake(stake, symbol)
             # Re-validate after capping — _cap_stake() can only raise a
@@ -1805,10 +1898,6 @@ class DerivClient:
             if elapsed < 3.0:
                 await asyncio.sleep(3.0 - elapsed)
             self._last_buy_time = time.time()
-            # Balance-target guard: once TARGET_BALANCE is hit nothing may be priced or bought.
-            if target_guard.is_reached():
-                logger.warning("TARGET REACHED: order not sent - trading stopped")
-                return None
 
             if not (1 <= growth_rate <= 5):
                 logger.error(
@@ -2118,10 +2207,6 @@ class DerivClient:
             if elapsed < 3.0:
                 await asyncio.sleep(3.0 - elapsed)
             self._last_buy_time = time.time()
-            # Balance-target guard: once TARGET_BALANCE is hit nothing may be priced or bought.
-            if target_guard.is_reached():
-                logger.warning("TARGET REACHED: order not sent - trading stopped")
-                return None
 
             if contract_type is None:
                 logger.error(

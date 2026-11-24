@@ -17,7 +17,6 @@ import csv
 import json
 import logging
 import os
-import random
 import threading
 import time
 from collections import deque
@@ -43,24 +42,11 @@ def _cfg(name: str, default):
 
 
 class DonkeyGuard:
-    def __init__(self, edge_log_path: str = EDGE_LOG_PATH,
-                 state_env_key: str = "DONKEY_GUARD_STATE",
-                 cap_only: bool = False,
-                 cap_override: Optional[int] = None,
-                 label: str = "DONKEY GUARD"):
-        # Oct 2026 (Scout+Follower): per-instance options so the Follower gets
-        # its OWN guard (own env key / log), and the Scout's guard can run in
-        # "cap_only" mode (hourly cap only; no stop-loss/streak pauses) so it
-        # keeps collecting evidence. Defaults = old behaviour exactly.
-        self._state_env_key = state_env_key
-        self.cap_only = cap_only
-        self._cap_override = cap_override
-        self._label = label
+    def __init__(self, edge_log_path: str = EDGE_LOG_PATH):
         self._lock = threading.Lock()
         self._file_lock = threading.Lock()
         self._path = edge_log_path
         self._trade_times: Deque[float] = deque()
-        self._seen_ids: set = set()
         self._reset_session()
         self._halt_until = 0.0
         self._halt_reason = ""
@@ -84,7 +70,7 @@ class DonkeyGuard:
             })
 
     def load_from_env(self) -> None:
-        raw = os.environ.get(self._state_env_key, "")
+        raw = os.environ.get("DONKEY_GUARD_STATE", "")
         if not raw:
             return
         try:
@@ -109,30 +95,20 @@ class DonkeyGuard:
         self._session_pnl = 0.0
         self._session_stake_unit = 0.0  # learned from first trade
 
-    def reset_session(self) -> None:
-        """Public: start a fresh session (called when a profit-target pause
-        begins, so the stop-loss counts from zero afterwards)."""
-        with self._lock:
-            self._reset_session()
-            self._consec_losses = 0
-
     # ── gate: call before opening any new entry ─────────────────────────
     def can_enter(self, now: Optional[float] = None) -> Tuple[bool, str]:
         if not self.enabled:
             return True, ""
         now = time.time() if now is None else now
         with self._lock:
-            if self.cap_only:
-                pass   # Scout data mode: only the hourly cap below applies
-            elif now < self._halt_until:
+            if now < self._halt_until:
                 mins = (self._halt_until - now) / 60
                 return False, f"{self._halt_reason} — halted {mins:.0f}min more"
-            elif now < self._pause_until:
+            if now < self._pause_until:
                 mins = (self._pause_until - now) / 60
                 return False, f"loss-streak pause — {mins:.1f}min more"
 
-            cap = int(self._cap_override if self._cap_override is not None
-                      else _cfg("DONKEY_GUARD_MAX_TRADES_PER_HOUR", 60))
+            cap = int(_cfg("DONKEY_GUARD_MAX_TRADES_PER_HOUR", 60))
             while self._trade_times and now - self._trade_times[0] > 3600:
                 self._trade_times.popleft()
             if cap > 0 and len(self._trade_times) >= cap:
@@ -147,24 +123,8 @@ class DonkeyGuard:
     # ── settlement hook ─────────────────────────────────────────────────
     def record(self, *, symbol: str, signal_kind: str, contract: str,
                barrier, stake: float, payout: float, won: bool, pnl: float,
-               now: Optional[float] = None, contract_id: str = "",
-               confirmed: bool = True) -> None:
+               now: Optional[float] = None) -> None:
         now = time.time() if now is None else now
-        # Only a CONFIRMED close (contract settled, final profit known) may
-        # count. An open/expired-but-unsettled contract reports profit == -stake
-        # because the stake was deducted — that is not a loss.
-        if not confirmed:
-            logger.warning(
-                f"DONKEY GUARD: ignoring unconfirmed result for contract "
-                f"{contract_id or '?'} ({symbol}) pnl={pnl:+.4f} — not a settled close")
-            return
-        if contract_id:
-            if contract_id in self._seen_ids:
-                return                       # never count the same contract twice
-            self._seen_ids.add(contract_id)
-            if len(self._seen_ids) > 500:
-                self._seen_ids.clear()
-        won = pnl > 0
         breakeven = (stake / payout) if payout and payout > stake > 0 else ""
         try:
             row = {
@@ -181,49 +141,27 @@ class DonkeyGuard:
         except Exception as exc:  # logging must never break trading
             logger.warning(f"edge log write failed: {exc}")
 
-        if not self.enabled or self.cap_only:
+        if not self.enabled:
             return
         with self._lock:
             if self._session_stake_unit == 0.0 and stake > 0:
                 self._session_stake_unit = stake
             unit = self._session_stake_unit or stake or 1.0
             self._session_pnl += pnl
-            if pnl > 0:
-                self._consec_losses = 0
-            elif pnl < 0:                    # only a real, confirmed loss
-                self._consec_losses += 1
-            # pnl == 0 (cancelled / break-even): neither a win nor a loss
-            logger.info(
-                f"DONKEY GUARD: confirmed {'WIN' if pnl > 0 else 'LOSS' if pnl < 0 else 'FLAT'} "
-                f"contract={contract_id or '?'} pnl={pnl:+.4f} | streak={self._consec_losses} "
-                f"session_pnl={self._session_pnl:+.4f}")
+            self._consec_losses = 0 if won else self._consec_losses + 1
 
-            tiered = None
-            if bool(_cfg("DONKEY_GUARD_TIERED", True)):
-                try:  # thresholds by account range / stake (balance_tiers.py)
-                    import balance_tiers
-                    tiered = balance_tiers.guard_params_for_stake(unit)
-                except Exception as exc:
-                    logger.warning(f"DONKEY GUARD: tier lookup failed: {exc}")
-
-            max_losses = int(tiered["loss_streak"] if tiered
-                             else _cfg("DONKEY_GUARD_CONSEC_LOSS_LIMIT", 8))
+            max_losses = int(_cfg("DONKEY_GUARD_CONSEC_LOSS_LIMIT", 8))
             if max_losses > 0 and self._consec_losses >= max_losses:
-                mins = self._draw_mins("DONKEY_GUARD_CONSEC_LOSS_PAUSE_MIN_MINS",
-                                       "DONKEY_GUARD_CONSEC_LOSS_PAUSE_MAX_MINS",
-                                       "DONKEY_GUARD_CONSEC_LOSS_PAUSE_MINS", 30)
+                mins = float(_cfg("DONKEY_GUARD_CONSEC_LOSS_PAUSE_MINS", 30))
                 self._pause_until = now + mins * 60
                 logger.warning(
                     f"DONKEY GUARD: {self._consec_losses} losses in a row — "
                     f"pausing new entries {mins:.0f}min")
                 self._consec_losses = 0
 
-            sl = float(tiered["sl_stakes"] if tiered
-                       else _cfg("DONKEY_GUARD_SESSION_STOP_LOSS_STAKES", 15))
+            sl = float(_cfg("DONKEY_GUARD_SESSION_STOP_LOSS_STAKES", 15))
             tp = float(_cfg("DONKEY_GUARD_SESSION_TAKE_PROFIT_STAKES", 10))
-            if bool(_cfg("PROFIT_PAUSE_ENABLED", False)):
-                tp = 0.0   # profit_pause.py owns take-profit (45 min pause)
-            halt_mins = None   # drawn below only if a halt actually triggers
+            halt_mins = float(_cfg("DONKEY_GUARD_HALT_MINS", 120))
             in_stakes = self._session_pnl / unit
             reason = ""
             if sl > 0 and in_stakes <= -sl:
@@ -231,27 +169,11 @@ class DonkeyGuard:
             elif tp > 0 and in_stakes >= tp:
                 reason = f"session take-profit hit ({in_stakes:+.1f} stakes)"
             if reason:
-                halt_mins = self._draw_mins("DONKEY_GUARD_HALT_MIN_MINS",
-                                            "DONKEY_GUARD_HALT_MAX_MINS",
-                                            "DONKEY_GUARD_HALT_MINS", 120)
                 self._halt_until = now + halt_mins * 60
                 self._halt_reason = reason
                 logger.warning(f"DONKEY GUARD: {reason} — no new entries "
                                f"for {halt_mins:.0f}min, then fresh session")
                 self._reset_session()  # next session starts from zero
-
-    @staticmethod
-    def _draw_mins(min_key: str, max_key: str, fixed_key: str, fixed_default: float) -> float:
-        """Random length between config min/max; falls back to the old fixed
-        value if the range keys are missing."""
-        lo = _cfg(min_key, None)
-        hi = _cfg(max_key, None)
-        if lo is None or hi is None:
-            return float(_cfg(fixed_key, fixed_default))
-        lo, hi = float(lo), float(hi)
-        if hi < lo:
-            lo, hi = hi, lo
-        return random.uniform(lo, hi)
 
     # ── internals ───────────────────────────────────────────────────────
     def _append_csv(self, row: dict) -> None:

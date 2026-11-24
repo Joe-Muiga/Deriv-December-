@@ -33,7 +33,7 @@ import time
 import datetime
 import logging
 import requests
-from flask import Flask, jsonify, Response
+from flask import Flask, jsonify, Response, request
 import config
 
 try:
@@ -345,13 +345,15 @@ def update_suspended_symbols(suspended: list) -> None:
 
 
 def trigger_redeploy() -> None:
-    url = os.environ.get("RENDER_DEPLOY_HOOK_URL", "")
-    if not url:
-        logger.error("trigger_redeploy: RENDER_DEPLOY_HOOK_URL not set")
+    import render_api
+    target = render_api.deploy_target()
+    if not target:
+        logger.error("trigger_redeploy: neither RENDER_API_KEY nor RENDER_DEPLOY_HOOK_URL is set")
         return
-    logger.info("trigger_redeploy: sending POST to Render deploy hook …")
+    url, hdrs = target
+    logger.info("trigger_redeploy: sending POST to Render …")
     try:
-        resp = requests.post(url, timeout=15)
+        resp = requests.post(url, headers=hdrs, timeout=15)
         if resp.ok:
             logger.info(f"trigger_redeploy: SUCCESS — HTTP {resp.status_code}")
         else:
@@ -658,12 +660,26 @@ def _render_dashboard() -> str:
                 '</div>'
             )
 
+        # ── Link to the predictor minute-of-hour panel (replaces the old widgets) ──
+        ks_html = ('<div style="margin:0 0 16px 0"><a href="/predictor" style="color:var(--blue,#58a6ff);'
+                   'font-weight:700">Predictor · minute-of-hour stats &rarr;</a></div>')
+
         # ── SVG charts ────────────────────────────────────────────────────────
         svg_balance = _build_svg_chart(
             s.get("balance_history", []),
             start_balance=day_start or None,
         )
         svg_hourly  = _build_hourly_svg(s.get("hourly_pnl", {}))
+        chart_scope, bar_scope = "Today", "Hourly P&amp;L — Today (UTC)"
+        try:                                   # 24 h account history (MH mode) replaces both charts when available
+            import account_history as _ah
+            _b, _k = _ah.balance_svg(), _ah.bucket_svg()
+            if _b:
+                svg_balance, chart_scope = _b, "Last 24 h"
+            if _k:
+                svg_hourly, bar_scope = _k, "P&amp;L per 10 min — Last 24 h (UTC)"
+        except Exception:
+            pass
 
         # ── Recent trades table (last 100) ────────────────────────────────────
         recent_trades_list = s.get("recent_trades", [])
@@ -903,6 +919,13 @@ def _render_dashboard() -> str:
   .dot-yellow{{background:var(--yellow);box-shadow:0 0 6px var(--yellow);}}
   .dot-red   {{background:var(--red);   box-shadow:0 0 6px var(--red);}}
   .status-text{{font-size:12px;color:var(--muted);}}
+  .ks-wrap{{margin:0 0 16px 0;}}
+  .ks-btn{{width:100%;padding:18px 14px;font-size:17px;font-weight:700;border:0;border-radius:10px;
+           cursor:pointer;letter-spacing:.02em;-webkit-tap-highlight-color:transparent;}}
+  .ks-pause{{background:#da3633;color:#fff;}}
+  .ks-resume{{background:#238636;color:#fff;}}
+  .ks-btn:active{{transform:scale(.98);}}
+  .ks-note{{font-size:11px;color:var(--yellow);margin-top:6px;}}
   .paused-banner{{background:#3a1a1a;border:1px solid var(--red);border-radius:6px;
                   padding:10px 14px;margin-bottom:14px;color:var(--red);font-size:13px;}}
   .bar-wrap{{background:#21262d;border-radius:4px;height:8px;margin-top:6px;overflow:hidden;}}
@@ -922,6 +945,7 @@ def _render_dashboard() -> str:
 <h1>⚡ Deriv Bot</h1>
 <p class="subtitle">Auto-refreshes every 10 s &nbsp;|&nbsp; UTC {now_utc} &nbsp;|&nbsp; Queue: {queue_count}</p>
 
+{ks_html}
 {paused_banner}
 
 <div class="status-row">
@@ -1039,7 +1063,7 @@ def _render_dashboard() -> str:
 
 <!-- ── 4. Balance Curve ── -->
 <div class="chart-card">
-  <div class="chart-title">Balance Curve — Today
+  <div class="chart-title">Balance Curve — {chart_scope}
     <span style="float:right;font-weight:400;color:#3fb950">● win</span>
     <span style="float:right;font-weight:400;color:#f85149;margin-right:10px">● loss</span>
     <span style="float:right;font-weight:400;color:#d29922;margin-right:10px">● timeout</span>
@@ -1049,7 +1073,7 @@ def _render_dashboard() -> str:
 
 <!-- ── 5. Hourly P&L ── -->
 <div class="chart-card">
-  <div class="chart-title">Hourly P&amp;L — Today (UTC)</div>
+  <div class="chart-title">{bar_scope}</div>
   {svg_hourly}
 </div>
 
@@ -1250,15 +1274,77 @@ def _render_strategy_stats_page() -> str:
 
 @app.route("/")
 def index():
-    html = _render_dashboard()
-    # Oct 2026 (Scout+Follower): add the Scout/Follower panel to this page.
-    # inject() is a no-op when disabled and never raises.
-    try:
-        import sf_dashboard
-        html = sf_dashboard.inject(html)
-    except Exception:
-        pass
-    return Response(html, mimetype="text/html")
+    return Response(_render_dashboard(), mimetype="text/html")
+
+
+import hmac as _hmac
+
+_pin_fail: dict = {}   # ip -> (count, window_start) — tiny PIN brute-force limiter
+
+
+def _expected_pin() -> str:
+    pin = (os.environ.get("DASHBOARD_PIN") or "").strip()
+    if pin:
+        return pin
+    tok = (getattr(config, "DERIV_API_TOKEN", "") or "").strip()
+    return tok[-6:] if tok else ""
+
+
+def _check_pin(supplied: str) -> bool:
+    want = _expected_pin()
+    if not want:
+        return True
+    return _hmac.compare_digest(str(supplied or "").strip().encode(), want.encode())
+
+
+@app.route("/predictor")
+def predictor_page():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
+    with open(path, encoding="utf-8") as f:
+        return Response(f.read(), mimetype="text/html")
+
+
+@app.route("/api/predictor_stats")
+def predictor_stats_api():
+    ip  = request.headers.get("X-Forwarded-For", request.remote_addr or "?").split(",")[0].strip()
+    now = time.time()
+    cnt, since = _pin_fail.get(ip, (0, now))
+    if now - since > 60:
+        cnt, since = 0, now
+    if cnt >= 5:
+        return jsonify({"error": "too many attempts"}), 429
+    pin = request.headers.get("X-Pin") or request.args.get("pin", "")
+    if not _check_pin(pin):
+        _pin_fail[ip] = (cnt + 1, since)
+        return jsonify({"error": "bad pin"}), 403
+    _pin_fail.pop(ip, None)
+    import predictor_stats
+    return jsonify(predictor_stats.analyze(predictor_stats.get_stats().snapshot()))
+
+
+@app.route("/api/exp_report")
+def exp_report_api():
+    """Pre-registered test report: verdict, balance vs expected path, three numbers, diagnostics (PIN protected)."""
+    ip  = request.headers.get("X-Forwarded-For", request.remote_addr or "?").split(",")[0].strip()
+    now = time.time()
+    cnt, since = _pin_fail.get(ip, (0, now))
+    if now - since > 60:
+        cnt, since = 0, now
+    if cnt >= 5:
+        return jsonify({"error": "too many attempts"}), 429
+    pin = request.headers.get("X-Pin") or request.args.get("pin", "")
+    if not _check_pin(pin):
+        _pin_fail[ip] = (cnt + 1, since)
+        return jsonify({"error": "bad pin"}), 403
+    _pin_fail.pop(ip, None)
+    import exp_stats
+    return jsonify(exp_stats.EXP.latest())
+
+
+@app.route("/api/history24")
+def history24_api():
+    import account_history
+    return jsonify(account_history.get_series())
 
 
 @app.route("/health")
@@ -1299,6 +1385,10 @@ def stats_route():
         "streak":             int(s.get("streak", 0)),
         "streak_label":       str(s.get("streak_label", "—")),
         "paused":             bool(s.get("paused_for_loss_limit", False)),
+        "target_balance":     s.get("target_balance"),
+        "money":              s.get("money"),   # main-account profit floor / stake sizing
+        "target_reached":     bool(s.get("target_reached", False)),
+        "target_reached_balance": s.get("target_reached_balance"),
         "current_symbol":     str(s.get("current_symbol", "—")),
         "session":            str(s.get("session", "—")),
         "uptime_seconds":     int(s.get("uptime_seconds", 0)),

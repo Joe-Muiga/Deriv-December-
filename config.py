@@ -6,9 +6,7 @@ DEBUG     = False
 VERSION   = "1.1.0"
 
 # ── DERIV API ─────────────────────────────────────────────────
-# Oct 2026 (Scout+Follower): DERIV_SCOUT_TOKEN, when set, is the Scout's token;
-# otherwise the original DERIV_API_TOKEN is used exactly as before.
-DERIV_API_TOKEN   = os.environ.get("DERIV_SCOUT_TOKEN") or os.environ.get("DERIV_API_TOKEN", "")
+DERIV_API_TOKEN   = os.environ.get("DERIV_API_TOKEN", "")
 DERIV_APP_ID      = os.environ.get("DERIV_APP_ID", "1089")
 # "real" or "demo" — picks which Options account _fetch_otp_ws_url() mints
 # an OTP for (deriv_client.py). Was previously never read from env, so it
@@ -151,7 +149,43 @@ RISE_FALL_SYMBOLS = [
 #      before reassigning a symbol off its current strategy.
 # signal_engine.py checks `if symbol in config.DIGIT_SYMBOLS`; empty means
 # that branch is always skipped.
-DIGIT_SYMBOLS = []
+# Digit predictor (the ONLY strategy) — comma separated env override.
+# Accepts a comma list, e.g. "R_100,R_75,1HZ100V", or the shortcut ALL_VOLATILITY (all ten
+# Volatility indices). Step Index (stpRNG*), Boom and Crash are always dropped; override the
+# filter with PREDICTOR_SYMBOL_BLOCKLIST (comma separated, case-insensitive prefixes).
+_VOLATILITY_ALL = ["R_10", "R_25", "R_50", "R_75", "R_100",
+                   "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
+_DEFAULT_BLOCK  = "stpRNG,STEP,BOOM,CRASH,JD,RDB"   # prefixes: Step, Boom, Crash, all Jump, Bear/Bull
+# Shortcut ALL_SYMBOLS (the default): every digit-capable index the project knows - the ten
+# Volatility indices, the higher 1s Volatility tiers, Jump and Bear/Bull - minus the blocklist
+# above (Step, Boom, Crash). A symbol Deriv does not offer is skipped at start-up (see bot_engine).
+_ALL_SYMBOLS_LIST = (_VOLATILITY_ALL + ["1HZ150V", "1HZ200V", "1HZ250V"]
+                     + ["JD10", "JD25", "JD50", "JD75", "JD100"] + ["RDBEAR", "RDBULL"])
+
+
+def _parse_symbols(raw: str):
+    block = tuple(b.strip().upper() for b in
+                  os.environ.get("PREDICTOR_SYMBOL_BLOCKLIST", _DEFAULT_BLOCK).split(",") if b.strip())
+    wanted = []
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok.upper() == "ALL_SYMBOLS":
+            wanted += _ALL_SYMBOLS_LIST
+        else:
+            wanted += _VOLATILITY_ALL if tok.upper() in ("ALL_VOLATILITY", "VOLATILITY", "ALL") else [tok]
+    out = []
+    for sym in wanted:
+        if any(sym.upper().startswith(b) for b in block) or sym in out:
+            continue
+        out.append(sym)
+    return out or ["R_100"]
+
+
+PREDICTOR_SYMBOLS = _parse_symbols(os.environ.get("PREDICTOR_SYMBOLS", "ALL_SYMBOLS"))
+# signal_engine routes these symbols to predictor.py
+DIGIT_SYMBOLS = list(PREDICTOR_SYMBOLS)
 
 # ── STRATEGY ROUTING (signal_engine.py) ──────────────────────
 # Every traded symbol is routed to exactly one strategy evaluator.
@@ -862,7 +896,7 @@ SCALED_SL_TARGET_MULT         = 0.35   # was 0.60
 # flat, non-renewing clock this many minutes long. Only that pair sits out;
 # every other indicator keeps trading that symbol, and this indicator keeps
 # trading every other symbol. See pair_suspension.py.
-PAIR_SUSPEND_MINUTES = 0  # REMOVED PER REQUEST - pauses/suspensions off
+PAIR_SUSPEND_MINUTES = 60
 
 # ── POPULAR INDICATOR CONFLUENCE STRATEGY (user-directed, Aug 2026) ──────
 # Replaces the strategy used to trade every symbol in MULTIPLIER_SYMBOLS
@@ -949,46 +983,7 @@ POPULAR_HURST_MIN_BARS      = 40
 # immediately, no other stake logic runs at all. Set False to restore all
 # of the dynamic sizing below exactly as it was.
 MANUAL_STAKE_MODE   = True
-MANUAL_STAKE_AMOUNT = 0.5
-
-# STAKE FROM ENVIRONMENT: set STAKE_AMOUNT (or PREDICTOR_STAKE) on Render to a
-# fixed stake per trade, e.g. STAKE_AMOUNT=1669. When set (> 0) it overrides the
-# balance-tier table and MANUAL_STAKE_AMOUNT below, and is sent to Deriv exactly
-# as written (the 50%-of-balance stake cap is skipped for it). Unset / 0 / not a
-# number -> the balance-tier stake is used as before. Restart the service after
-# changing it.
-def _env_stake():
-    for _name in ("STAKE_AMOUNT", "PREDICTOR_STAKE"):
-        _raw = (os.environ.get(_name) or "").strip().replace(",", "").lstrip("$")
-        if not _raw:
-            continue
-        try:
-            _val = float(_raw)
-        except ValueError:
-            continue
-        if _val > 0:
-            return _val
-    return None
-
-STAKE_AMOUNT = _env_stake()
-
-# BALANCE-TIER STAKING (Sep 2026, chat-requested): stake follows the account
-# balance band table in balance_tiers.py ($0.35 up to $8 ... $2,000 from
-# $36,500 to $50,000). Takes priority over MANUAL_STAKE_MODE while True.
-BALANCE_TIER_STAKE_MODE = True
-
-# PROFIT-TARGET PAUSE: once session profit reaches the target for the stake
-# tier (balance_tiers.py), stop opening trades, drain open contracts and
-# pause a random PROFIT_PAUSE_MIN..MAX_MINUTES (11-18). Session = since the last pause ended; its start
-# balance is persisted in the PROFIT_PAUSE_START_BALANCE env var (needs the
-# same RENDER_API_KEY/RENDER_SERVICE_ID as fixed_cycle.py).
-# TARGET_BASIS: "start" = tier of the session's starting balance fixes the
-# target; "current" = tier of the live balance is used on every check.
-PROFIT_PAUSE_ENABLED      = False  # REMOVED PER REQUEST - pauses/suspensions off
-PROFIT_PAUSE_MIN_MINUTES  = 11   # pause length is drawn uniformly at random
-PROFIT_PAUSE_MAX_MINUTES  = 18   # between these (was a fixed 45)
-PROFIT_PAUSE_TARGET_BASIS = "start"
-
+MANUAL_STAKE_AMOUNT = 0.35
 # Only remaining size-relevant guard when MANUAL_STAKE_MODE is True:
 # MAX_CONCURRENT_TRADES below caps position COUNT (not total $ exposure) —
 # at 100.0 × that limit, worst-case simultaneous exposure is bounded, just
@@ -998,7 +993,7 @@ BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
                                 # IS the compounding: stake grows/shrinks
                                 # automatically as balance grows/shrinks.
                                 # INACTIVE while MANUAL_STAKE_MODE = True.
-MIN_STAKE            = 0.35   # Sep 2026: tier ladder starts at 0.35 (was 0.5). UPDATED — was 100, then 0.35. Now matches
+MIN_STAKE            = 0.35    # UPDATED — was 100, then 0.35. Now matches
                                 # MANUAL_STAKE_AMOUNT ($0.5); the
                                 # codebase's own built-in default
                                 # (risk_manager.py's RiskManager falls back
@@ -1023,7 +1018,7 @@ MIN_STAKE            = 0.35   # Sep 2026: tier ladder starts at 0.35 (was 0.5). 
                                 # zeroed it outright rather than shrinking it
                                 # — a hard stop after as few as 2 consecutive
                                 # losses, not a graceful size-down.
-MAX_STAKE            = 2000.0  # Sep 2026: tier ladder tops out at 2000 (was 1000). safety backstop only, not the everyday driver.
+MAX_STAKE            = 1_000_000.0  # raised: a 1000.00 predictor stake is never clamped.
                                 # INACTIVE while MANUAL_STAKE_MODE = True.
 DAILY_LOSS_LIMIT_PCT = float("inf")  # REMOVED PER REQUEST — was 0.06 (6%).
                                 # bot_engine._check_confirmed_loss_limit()
@@ -1033,7 +1028,7 @@ DAILY_LOSS_LIMIT_PCT = float("inf")  # REMOVED PER REQUEST — was 0.06 (6%).
                                 # so trading is never auto-paused on daily loss.
                                 # DAILY_LOSS_PAUSE_MINS below is now unused —
                                 # nothing left to trigger a pause to time out.
-DAILY_LOSS_PAUSE_MINS = 0  # REMOVED PER REQUEST - pauses/suspensions off
+DAILY_LOSS_PAUSE_MINS = 30
 
 # FIX (profitability audit, round 2): global, account-wide circuit breaker —
 # pause ALL new entries (any symbol/strategy) after this many consecutive
@@ -1189,7 +1184,7 @@ RECONCILE_MAX_SECS           = 1800   # 30 min — far longer than any real
 MULTIPLIER_MAX_HOLD_MINS = 30
 
 # ── SYMBOL SUSPENSION (minutes) ──────────────────────────────
-SYMBOL_WIN_SUSPEND_MINS   = 0  # REMOVED PER REQUEST - pauses/suspensions off
+SYMBOL_WIN_SUSPEND_MINS   = 30     # was 20 — increased by 10min per user request
 SYMBOL_MIN_GAP_MINS       = 1
 
 # Escalating per-symbol loss suspension ladder (Implementation Brief v2,
@@ -1200,7 +1195,7 @@ SYMBOL_MIN_GAP_MINS       = 1
 # restart) — never by a UTC-midnight or other calendar boundary.
 # Replaces the old flat SYMBOL_LOSS_SUSPEND_MINS / SYMBOL_SESSION_BAN_LOSSES
 # (59,940-minute "session ban") scheme entirely.
-SESSION_LOSS_SUSPEND_LADDER_MINS = [0, 0, 0, 0]  # REMOVED PER REQUEST - pauses/suspensions off
+SESSION_LOSS_SUSPEND_LADDER_MINS = [70, 130, 190, 250]  # was [60,120,180,240] — +10min per tier per user request
 
 # ── RAW TICK BUFFER (feeds tick-based evaluators via evaluate(ticks=...)) ──
 TICK_BUFFER_MAXLEN = 200
@@ -1254,8 +1249,11 @@ SETTLE_WAIT_SECS = 15
 # Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
 # _next_scheduled_fire().
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_SECS  = 225      # Oct 2026: STRICT 3 min 45 s Scout leg, never-ending.
-REDEPLOY_INTERVAL_HOURS = REDEPLOY_INTERVAL_SECS / 3600   # (3m45s) was 4 min. 4-min Scout leg (was 5). 4 minutes, expressed as hours since
+# 0 (default) = scheduled self-redeploy DISABLED: the bot runs continuously and heals
+# itself in-process (reconnect, stale-tick watchdog, periodic refit). Set a positive
+# number of seconds only if you really want the old rolling redeploy back.
+REDEPLOY_INTERVAL_SECONDS = float(os.environ.get("REDEPLOY_INTERVAL_SECONDS", "0"))
+REDEPLOY_INTERVAL_HOURS = REDEPLOY_INTERVAL_SECONDS / 3600.0   # legacy derived value; hours since
                                       # that's the unit restart_scheduler.py
                                       # expects (interval_secs = hours*3600).
                                       # Was 13.7 min, before that 1h, 3h.
@@ -1278,7 +1276,7 @@ DAILY_LOSS_LIMIT   = DAILY_LOSS_LIMIT_PCT    # alias
 MIN_MODULES_FOR_SIGNAL     = 3
 MIN_INDICATOR_VOTES        = 3
 OB_EXPIRY_BARS             = 100
-NEWS_BLOCK_MINUTES         = 0  # REMOVED PER REQUEST - pauses/suspensions off
+NEWS_BLOCK_MINUTES         = 60
 FOREX_LTF_GRANULARITY      = 900
 OTHER_LTF_GRANULARITY      = 60
 MIN_SIGNAL_PROBABILITY     = 1.8
@@ -1619,403 +1617,208 @@ EXIT_ML_MIN_CONFIDENCE      = 0.60   # ML must be at least this confident a
                                       # layer's HOLD decision
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DONKEY STRATEGY — inverted digit-frequency + inverted trend-filter
+# DIGIT PREDICTOR — the only strategy (all values have env overrides)
 # ═══════════════════════════════════════════════════════════════════════════
-# Signal 1 (frequency): bets the HOT digit (last DONKEY_FREQ_WINDOW ticks)
-#   continues, structured so the COLD digit falls on the losing side.
-# Signal 2 (trend filter): DONKEY_TREND_SMA_PERIOD-tick SMA; fires
-#   DIGITUNDER at DONKEY_TREND_BARRIER only when the current tick is BELOW
-#   the SMA. See signal_engine.evaluate_donkey_strategy() for the exact
-#   logic, and deriv_client.DerivClient._digit_contract_type() for the
-#   DIGITOVER/DIGITUNDER support this relies on.
-#
-# DONKEY_STRATEGY_ENABLED doubles as the GLOBAL EXECUTION GATE — see
-# SignalEngine.evaluate() in signal_engine.py, checked FIRST, before any
-# other evaluator in that file. While True (the default), Donkey Strategy
-# is the ONLY strategy in the entire bot that can produce a tradeable
-# signal; every other evaluate_*() function stays in the file untouched
-# but unreachable. Setting this False does not hand control back to the
-# legacy multi-strategy routing — it just stops the bot from trading at
-# all. There is deliberately no separate toggle for that.
-DONKEY_STRATEGY_ENABLED = True
+def _env_f(k, d):
+    try:
+        return float(os.environ.get(k, d))
+    except (TypeError, ValueError):
+        return float(d)
 
-# Symbols Donkey Strategy is allowed to trade — defaults to the full
-# 26-symbol universe already wired into ALL_TRADE_SYMBOLS. NOTE: this
-# file's own STRATEGY ROUTING section above documents that DIGITOVER/
-# DIGITUNDER (digit-contract) support has only been explicitly
-# audit-confirmed for JD10-JD100 and RDBEAR/RDBULL on this account — the
-# rest are included per spec ("all 26 symbols") but are UNVERIFIED for
-# digit contracts specifically. buy_digit_contract() already fails safe
-# (logs the proposal error, returns None — no crash) if Deriv rejects a
-# symbol for DIGITOVER/DIGITUNDER, so nothing breaks either way, but don't
-# be surprised if some symbols simply never place a trade. Narrow this
-# list to a confirmed subset once you've checked contracts_for per symbol.
-DONKEY_STRATEGY_SYMBOLS = list(ALL_TRADE_SYMBOLS)
 
-# "INDEPENDENT": Signal 1 and Signal 2 each fire on their own whenever
-#   they individually qualify (Signal 1 checked first; falls through to
-#   Signal 2 only if Signal 1 has no read on that tick).
-# "COMBINED": only fires when both signals agree — both must have a read
-#   AND both land on DIGITUNDER (Signal 2 is DIGITUNDER-only by spec, so a
-#   Signal-1 OVER pick can never combine — independent mode still fires
-#   it, combined mode just won't on those ticks), taking the more
-#   restrictive of the two barriers (min) so a combined win is guaranteed
-#   to satisfy both signals' individual criteria at once.
-DONKEY_STRATEGY_MODE = "INDEPENDENT"   # "INDEPENDENT" | "COMBINED"
+def _env_i(k, d):
+    return int(_env_f(k, d))
 
-# ── Donkey variant lock (Sep 2026, chat-requested) ─────────────────────
-# The strategy-cycle balance-trend switch and the RAW variant it could
-# switch onto are BOTH disabled now — see signal_engine.
-# _donkey_active_variant(), which no longer reads strategy_cycle.py at
-# all and unconditionally returns "ORIGINAL". strategy_cycle.py itself
-# is no longer imported anywhere (dead file, kept only for reference).
-# ORIGINAL = has inversion (bets hot digit continues, DIGITUNDER trend
-#   filter) — the only variant that can trade now.
-# ── CONTRARIAN SWITCH (Oct 2026, chat-requested) ───────────────────────
-# False = ORIGINAL: follows the hot digit (hot inside the winning zone,
-#         cold outside) — same side as the usual digit-education crowd.
-# True  = CONTRARIAN: fades the hot digit (cold inside the winning zone,
-#         hot outside); trend signal flips UNDER t -> OVER 9-t. Same
-#         payout-ratio barrier selection, significance gate and guard.
-# This changes WHICH side you bet, not the odds: P(win) per barrier and
-# the payout are identical, so expected value is unchanged (still
-# slightly negative after Deriv's margin).
-DONKEY_CONTRARIAN = True
 
-DONKEY_CYCLE_START = "ORIGINAL"        # kept only as _donkey_active_
-                                        # variant()'s belt-and-suspenders
-                                        # fallback value; not otherwise
-                                        # read anymore.
+def _env_tuple(k, d):
+    raw = os.environ.get(k, "").strip()
+    if not raw:
+        return tuple(d)
+    return tuple(int(x) for x in raw.split(",") if x.strip())
 
-# ── Fixed trading cycle (Sep 2026, chat-requested; restructured same
-#    day from an earlier two-leg version — leg 2 removed, cooldown
-#    length randomized. Supersedes and disables the old balance-trend
-#    Donkey switch above AND the profit-target cycle that used to live
-#    in this section; strategy_cycle.py and profit_cycle.py are no
-#    longer imported anywhere) ────────────────────────────────────────
-# Trading now runs on a simple, fixed, never-ending single-leg pattern
-# instead of anything balance-, profit-, drawdown-, or time-of-day-
-# driven — see fixed_cycle.py for the full state machine:
-#   1. Trade for FIXED_CYCLE_LEG_MINUTES ("leg 1") — ONE deploy, no
-#      auto-redeploy while it's running. REDEPLOY_INTERVAL_HOURS above
-#      is already set to this same 5 minutes, so the existing rolling-
-#      redeploy mechanism (restart_scheduler.py) IS leg 1's timer — no
-#      separate clock needed for it, and its firing always means leg 1
-#      just ended (there's no leg 2 to redeploy into anymore).
-#   2. Drain open contracts, then disconnect from Deriv entirely for a
-#      cooldown drawn fresh, uniformly at random, between
-#      FIXED_CYCLE_COOLDOWN_MIN_MINUTES and FIXED_CYCLE_COOLDOWN_MAX_
-#      MINUTES (health checks only during this window), then redeploy
-#      back into a fresh leg 1.
-#   3. Repeat forever. Nothing — not daily drawdown, not profit, not
-#      time of day — can skip, shorten, lengthen, or pause any of this.
-FIXED_CYCLE_ENABLED = False   # Oct 2026: fixed leg->cooldown cycle is OFF. Scout just redeploys
-                               # every REDEPLOY_INTERVAL_SECS and keeps trading, forever.
-FIXED_CYCLE_LEG_MINUTES          = 4     # Oct 2026: was 5. length of leg 1 — kept equal
-                                          # to REDEPLOY_INTERVAL_HOURS
-                                          # (5 min) above; change both
-                                          # together if you ever want a
-                                          # different leg length
-FIXED_CYCLE_COOLDOWN_MIN_MINUTES = 1     # was 75 — lower bound of the
-                                          # randomized cooldown after
-                                          # every leg 1
-FIXED_CYCLE_COOLDOWN_MAX_MINUTES = 3     # was 150 — upper bound; a fresh
-                                          # value is drawn uniformly at
-                                          # random between these two
-                                          # every time leg 1 ends (see
-                                          # fixed_cycle.enter_cooldown_
-                                          # now()), then persisted as an
-                                          # absolute deadline so it
-                                          # can't be re-rolled by a
-                                          # redeploy landing mid-cooldown
 
-# Render API credentials used ONLY to persist fixed_cycle.py's state
-# (trading/cooldown phase + the cooldown deadline) into this service's
-# own env vars so it survives a redeploy — Render's disk here is
-# ephemeral, so without these the bot would forget an in-progress
-# cooldown (and its randomly chosen length) on any redeploy that lands
-# mid-cooldown for an unrelated reason.
+# Render API credentials: redeploy trigger + persisting minute-of-hour stats across redeploys.
 RENDER_API_KEY    = os.environ.get("RENDER_API_KEY", "")
 RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 
-# Signal 1 — frequency window (ticks) and minimum sample before it's
-# willing to call a hot/cold digit at all.
-DONKEY_FREQ_WINDOW      = 100
-DONKEY_FREQ_MIN_SAMPLE  = 100
+# PREDICTOR_SYMBOLS is defined next to DIGIT_SYMBOLS above.
+# Trade window: the bot opens contracts ONLY while the clock (UTC) is between minute 29 and minute 36
+# of the hour, inclusive: 29:00.0 up to and including 36:59.9. Strict - not an env var, so a stale value
+# on Render can never widen it. Outside it nothing is bought (ticks keep feeding the predictor).
+# SESSION_WINDOW_ENABLED (Render env var, default ON): 1 = trade only minutes 29-36, disconnected + redeployed
+# (cache cleared) the rest of the hour. 0 = window OFF: connected and trading every minute, no hourly redeploy.
+TRADE_WINDOW_ENABLED      = os.environ.get("SESSION_WINDOW_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+TRADE_WINDOW_START_MINUTE = 29
+TRADE_WINDOW_END_MINUTE   = 36
+PREDICTOR_STAKE          = _env_f("PREDICTOR_STAKE", 0.35)       # MINIMUM stake (Render env var); the money rules size up from it
+# Payout/stake window (checked against the LIVE proposal). Floor 2.0 = only contracts that pay
+# MORE than 2x the stake (OVER5/UNDER4 ~2.38x and up). The ceiling drops the long-shot contracts:
+# OVER8/UNDER1 pay ~8.3x but win only 10% of the time and cost ~16.7% of stake per trade in
+# expectation, versus ~4.8% for OVER5/UNDER4 and ~6.3% for OVER6/UNDER3. 0 = no ceiling.
+MIN_PAYOUT_RATIO         = _env_f("MIN_PAYOUT_RATIO", 2.0)
+MAX_PAYOUT_RATIO         = _env_f("MAX_PAYOUT_RATIO", 2.5)
+EDGE_MARGIN              = _env_f("EDGE_MARGIN", 0.01)
+WILSON_Z                 = _env_f("WILSON_Z", 2.0)
+MIN_CONTEXT_SAMPLES      = _env_i("MIN_CONTEXT_SAMPLES", 300)
+MIN_CONFIRM_SAMPLES      = _env_i("MIN_CONFIRM_SAMPLES", 30)
+CONTEXT_SIZES            = _env_tuple("CONTEXT_SIZES", (1, 2, 3))
+WARMUP_TICKS             = _env_i("WARMUP_TICKS", 5000)
+CONFIRM_FRACTION         = _env_f("CONFIRM_FRACTION", 0.2)
+CONTRACT_DURATION_TICKS  = _env_i("CONTRACT_DURATION_TICKS", 1)
+# Extra ticks between the last tick the bot saw and the contract's entry tick (0 when the
+# proposal+buy round trip is shorter than one tick interval). Horizon = duration + this.
+PREDICTOR_ENTRY_DELAY_TICKS = _env_i("PREDICTOR_ENTRY_DELAY_TICKS", 0)
+PREDICTOR_BARRIERS       = _env_tuple("PREDICTOR_BARRIERS", tuple(range(10)))
+PREDICTOR_ALPHA          = _env_f("PREDICTOR_ALPHA", 0.05)       # family-wise, Bonferroni-corrected
+PREDICTOR_PAYOUT_FACTOR  = _env_f("PREDICTOR_PAYOUT_FACTOR", 0.975)  # fallback payout estimate only
+PREDICTOR_MAX_PROPOSALS  = _env_i("PREDICTOR_MAX_PROPOSALS", 3)  # candidates priced per tick
 
-# Signal 2 — SMA period. DONKEY_TREND_BARRIER default raised 3 -> 8 (see
-# below) so this signal has a chance of clearing DONKEY_MIN_WIN_PROB
-# instead of being dead weight (UNDER 3 is a fixed 30%-of-digits contract
-# — see the P(win) note below).
-DONKEY_TREND_SMA_PERIOD = 8
-DONKEY_TREND_BARRIER    = 9    # UNDER 9 -> P=0.90, matches the max-win-
-                                # probability ceiling below so signal 2
-                                # can still qualify instead of always
-                                # losing to the 0.90 floor.
+# ─── SET MODE: predict a set of next digits, buy the Over/Under that covers it ─────────────────────
+# (set_predictor.py + set_engine.py). ON by default; SET_MODE=0 runs the original single-contract engine.
+# It honours TRADE_WINDOW_* (29-36), ignores MIN/MAX_PAYOUT_RATIO and EDGE_MARGIN, sizes stakes with the money rules (PREDICTOR_STAKE = minimum; SET_STAKE is no longer used), never uses Matches/Differs/Even/Odd,
+# and is DEMO-ONLY unless SET_ALLOW_REAL=1.
+SET_MODE               = os.environ.get("SET_MODE", "1").strip().lower() in ("1", "true", "yes", "on")
+SET_ALLOW_REAL         = os.environ.get("SET_ALLOW_REAL", "0").strip().lower() in ("1", "true", "yes", "on")
+SET_SIZE               = _env_i("SET_SIZE", 4)                    # digits predicted per tick
+SET_MAX_COVER_WIDTH    = _env_i("SET_MAX_COVER_WIDTH", 5)         # "clustered": cover wins on <= this many digits
+SET_CONTEXT_SIZES      = _env_tuple("SET_CONTEXT_SIZES", (1, 2, 3))
+SET_PRIOR_STRENGTH     = _env_f("SET_PRIOR_STRENGTH", 50.0)       # shrinkage toward uniform
+SET_BACKOFF_STRENGTH   = _env_f("SET_BACKOFF_STRENGTH", 30.0)     # shrinkage of a context toward its shorter one
+SET_MIN_SET_PROB       = _env_f("SET_MIN_SET_PROB", 0.0)          # optional: min P(next digit in set); 0 = off
+SET_MIN_SCORE          = _env_f("SET_MIN_SCORE", 0.0)             # optional: min (P(win) x payout/stake); 0 = off
+SET_STAKE              = _env_f("SET_STAKE", 1.0)                 # flat stake per contract (demo)
+SET_PRICE_TOP          = _env_i("SET_PRICE_TOP", 4)               # best symbols priced (in parallel) per scan
+SET_MAX_BUYS_PER_SCAN  = _env_i("SET_MAX_BUYS_PER_SCAN", 2)       # contracts bought (in parallel) per scan
+SET_MAX_OPEN           = _env_i("SET_MAX_OPEN", 6)                # max contracts open at once
+SET_COALESCE_SECONDS   = _env_f("SET_COALESCE_SECONDS", 0.05)     # wait so simultaneous ticks are ranked together
+SET_MIN_SCAN_GAP       = _env_f("SET_MIN_SCAN_GAP", 0.25)         # min seconds between scans (API rate limits)
+SET_SIGNAL_MAX_AGE_FRAC = _env_f("SET_SIGNAL_MAX_AGE_FRAC", 0.6)  # a signal dies after this fraction of a tick interval
+SET_REPORT_SECONDS     = _env_f("SET_REPORT_SECONDS", 300)        # accuracy/performance report period
 
-# ═══════════════════════════════════════════════════════════════════════
-# DONKEY WIN-RATE TUNING (Sep 28 2026, chat-requested — win rate was ~10%)
-# ═══════════════════════════════════════════════════════════════════════
-# Root cause of the ~10% win rate: signal_engine._donkey_signal_1_original
-# picked the barrier CLOSEST to the hot digit (OVER hot-1 / UNDER hot+1),
-# which is the NARROWEST winning zone of every barrier choice that still
-# keeps hot inside and cold outside — e.g. hot=9 -> OVER 8, a contract
-# that only wins on a single digit (10% of ticks). Signal 2 additionally
-# used a FIXED 30%-win DIGITUNDER 3, taken uncritically whenever it fired
-# and signal 1 hadn't. Neither signal's "score" (hot/cold frequency gap,
-# distance below the SMA) is actually a probability of winning — score
-# was being used as if it were one.
+# ─── MH MODE: multi-horizon digit model (mh_predictor.py + mh_engine.py), ON by default ─────────────
+# MH_MODE=0 -> old behaviour (SET_MODE / original engine). Everything MH keeps lives in memory only.
+def _env_b(k, d):
+    return os.environ.get(k, str(d)).strip().lower() in ("1", "true", "yes", "on")
+
+
+MH_MODE                = _env_b("MH_MODE", 1)
+MH_CLUSTER             = _env_b("MH_CLUSTER", 1)                  # 1 = SET-cluster contract choice inside MH; 0 = old MH edge logic
+MH_CLUSTER_WIDTHS      = _env_tuple("MH_CLUSTER_WIDTHS", (3, 4, 5))   # allowed cover widths (digits the cover wins on)
+MH_CLUSTER_PICK        = os.environ.get("MH_CLUSTER_PICK", "widest").strip().lower()   # widest = best win prob; tightest = best payout
+MH_MAX_OPEN            = _env_i("MH_MAX_OPEN", 0)                 # optional cap on open contracts; 0 = unlimited
+MH_MAX_PER_SCAN        = _env_i("MH_MAX_PER_SCAN", 0)             # optional cap on buys per scan; 0 = unlimited
+MH_MIN_PAYOUT_RATIO    = _env_f("MH_MIN_PAYOUT_RATIO", 1.9 if MH_CLUSTER else 2.0)   # real quote payout/stake floor
+MH_HISTORY_TICKS       = _env_i("MH_HISTORY_TICKS", 15000)        # ticks fetched per symbol at boot
+MH_BOOT_BUDGET_SECONDS = _env_f("MH_BOOT_BUDGET_SECONDS", 75)     # extra horizons are skipped past this
+MH_BOOT_CONCURRENCY    = _env_i("MH_BOOT_CONCURRENCY", 5)         # symbols initialised in parallel
+MH_HMAX_TRADE          = _env_i("MH_HMAX_TRADE", 4 if MH_CLUSTER else 5)               # trade horizons 1..N (paper-scored to 10)
+MH_DECAY               = _env_f("MH_DECAY", 0.998)                # per-observation decay of the models
+MH_GATE                = _env_i("MH_GATE", 1)                   # 0 = no log-loss gate: horizons trade even if not better than uniform
+MH_GATE_Z              = _env_f("MH_GATE_Z", 1.96)              # gate: lower CI bound of (ln10 - log-loss) must be > 0 at this z
+MH_MIN_EDGE            = _env_f("MH_MIN_EDGE", 0.0)               # admit if p_lb * payout/stake - 1 > this
+MH_MAX_PER_TARGET      = _env_i("MH_MAX_PER_TARGET", 4 if MH_CLUSTER else 2)           # contracts per (symbol, target tick)
+MH_DEADLINE_FRAC       = _env_f("MH_DEADLINE_FRAC", 0.85)         # buy must land within this fraction of a tick
+MH_API_CONCURRENCY     = _env_i("MH_API_CONCURRENCY", 6)          # simultaneous proposal/buy requests
+MH_PRICE_TOL           = _env_f("MH_PRICE_TOL", 0.02)             # max buy price = stake * (1 + tol)
+REDEPLOY_DRAIN         = _env_i("REDEPLOY_DRAIN", 0 if MH_MODE else 1)   # 0 = redeploy without waiting for open contracts
+PREDICTOR_STATS_FLUSH_SECONDS = _env_f("PREDICTOR_STATS_FLUSH_SECONDS", 30)
+MIN_TRADES_PER_MINUTE    = _env_i("MIN_TRADES_PER_MINUTE", 30)
+WINDOW_MINUTES           = _env_i("WINDOW_MINUTES", 10)
+REDEPLOY_DRAIN_MAX_SECONDS = _env_f("REDEPLOY_DRAIN_MAX_SECONDS", 60)
+REDEPLOY_HALT_MAX_SECONDS  = _env_f("REDEPLOY_HALT_MAX_SECONDS", 600)
+
+# ─── Continuous-running / self-healing (replaces the rolling redeploy) ────────
+# Reconnect forever (0 = unlimited) with exponential backoff capped at 60 s.
+WEBSOCKET_MAX_RECONNECTS      = _env_i("WEBSOCKET_MAX_RECONNECTS", 0)
+WEBSOCKET_RECONNECT_INTERVAL  = _env_f("WEBSOCKET_RECONNECT_INTERVAL", 3)
+# No tick for this long on a symbol -> re-subscribe; still nothing after another
+# window -> drop the WebSocket and reconnect.
+STALE_TICK_SECONDS            = _env_f("STALE_TICK_SECONDS", 30)
+FORCE_RECONNECT_MIN_GAP       = _env_f("FORCE_RECONNECT_MIN_GAP", 90)
+# Re-download recent ticks, re-probe payouts and re-fit the predictor in-process
+# (this is what the old redeploy did implicitly by rebooting). Also runs right after
+# any reconnect, because ticks may have been missed.
+REFIT_INTERVAL_SECONDS        = _env_f("REFIT_INTERVAL_SECONDS", 300)
+# Deriv returns at most ~1000 ticks per ticks_history call; page backwards up to
+# WARMUP_TICKS in total.
+TICK_HISTORY_PAGE_SIZE        = _env_i("TICK_HISTORY_PAGE_SIZE", 1000)
+# Persisting stats into a Render env var makes Render treat it as a config change
+# (it can restart the service). Only needed when self-redeploying; off otherwise.
+STATS_PERSIST_TO_RENDER       = os.environ.get(
+    "STATS_PERSIST_TO_RENDER",
+    "0" if MH_MODE else ("1" if REDEPLOY_INTERVAL_SECONDS > 0 else "0")).strip().lower() in ("1", "true", "yes", "on")
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════
+#  AUTO REDEPLOY  -  EASY-EDIT SECTION (keep this block at the very bottom of the file)
+# ════════════════════════════════════════════════════════════════════════════════════════════
+#  ALWAYS ON: the bot redeploys itself every AUTO_REDEPLOY_SECONDS (below), forever, in a never-ending
+#  cycle (the AUTO_REDEPLOY env var is no longer consulted). The only off switch is the Render env var
+#  REDEPLOY_INTERVAL_SECONDS=0. Needs RENDER_API_KEY set on Render.
 #
-# For a Deriv digit Over/Under contract, the win probability is a fact of
-# arithmetic, not a read on the market: DIGITOVER(b) wins on digits > b,
-# i.e. P = (9-b)/10; DIGITUNDER(b) wins on digits < b, i.e. P = b/10 —
-# true regardless of any hot/cold/trend read, as long as the underlying
-# last digit is close to uniformly distributed (true by design on these
-# synthetic indices). Two changes now apply:
-#   1. DONKEY_WIDEST_ZONE: signal 1's barrier is chosen to be the WIDEST
-#      zone that still keeps hot inside / cold outside (barrier = cold,
-#      not hot±1) — this alone raises the ceiling from ~10-50% to 50-90%
-#      depending on where the cold digit lands.
-#   2. DONKEY_MIN_WIN_PROB: a hard floor — evaluate_donkey_strategy() now
-#      computes both signals' actual P(win) and REJECTS the trade
-#      entirely (no entry that tick) unless the best one clears this bar,
-#      taking the higher-P(win) signal when both qualify instead of
-#      always preferring signal 1.
+#  A redeploy wipes the instance's local data - that is expected.
+#  While ON, the hourly trade window (minutes 29-36) is switched OFF, because the window scheduler
+#  runs its own redeploy cycle and the two would fight each other. Each cycle the bot stops opening
+#  trades, drains open contracts (max REDEPLOY_DRAIN_MAX_SECONDS), then fires the Render redeploy.
 #
-# ── IMPORTANT — this does NOT create a bigger edge, it reshapes the bet ──
-# Deriv prices Over/Under payouts off this same win probability (minus
-# its house edge), so a 90%-win contract pays out only slightly more than
-# stake per win, while the ~10-20%-win contracts the bot was taking
-# before pay out several times stake per win. Raising DONKEY_MIN_WIN_PROB
-# trades "loses often, wins big" for "wins often, wins small" — it does
-# NOT change the long-run expected value of a single bet, which stays
-# governed by Deriv's built-in edge either way. If most of the account's
-# actual profit has been coming from the rare big wins on those
-# low-probability barriers, pushing win rate this high can shrink realised
-# profit even though the strategy now "wins" far more often. Back-test /
-# paper-trade this before pointing it at a funded account, and treat
-# DONKEY_MIN_WIN_PROB as a dial, not a one-way switch — lower it (e.g.
-# 0.60-0.70) for a middle ground between win frequency and payout size.
-DONKEY_WIDEST_ZONE   = True    # False restores the old hot±1 barrier.
-                                # Only used when DONKEY_MIN_PAYOUT_RATIO
-                                # below is unset/0.
-# ── MAX-WIN-PROBABILITY MODE (Sep 28 2026, chat-requested — trade very
-# rarely, but only at the highest win probability the bot can reach) ────
-# 0.90 is not a chosen target, it's a HARD CEILING: on a single-tick Deriv
-# digit contract (Over/Under/Match/Differ) with a uniform last digit, the
-# best any barrier can ever score is 9/10 — e.g. DIGITOVER(0) loses only
-# if the digit is exactly 0, DIGITUNDER(9) loses only if it's exactly 9.
-# No barrier choice, scoring tweak, or combination of signals gets a
-# single such contract above 90% — there is no "closer to 1" available
-# from this contract family. Setting the floor here AT that ceiling means
-# only the rare tick where the widest-zone barrier lands on 0.90 (cold
-# digit reads exactly 0 or 9) clears it — simulated: ~10.3% of ticks
-# (vs. ~19% at a 0.80 floor), win rate 0.900 exactly, on 4M synthetic
-# ticks. Lower this (e.g. 0.80-0.85) for more trades at a still-high but
-# less extreme win rate.
-DONKEY_MIN_WIN_PROB  = 0.90    # 0.0-1.0, capped at 0.90 by contract math.
-                                # Only used when DONKEY_MIN_PAYOUT_RATIO
-                                # below is unset/0.
-DONKEY_MIN_SCORE     = 0.10    # signal-1 hot/cold gap floor (noise guard)
-DONKEY_TREND_MIN_SCORE = 0.20  # signal-2 below-SMA distance floor
+#  >>> CHANGE THE INTERVAL HERE (seconds). 420 = 7 minutes. <<<
+AUTO_REDEPLOY_SECONDS = 420
+# ────────────────────────────────────────────────────────────────────────────────────────────
+AUTO_REDEPLOY_ENABLED = True
 
-# ── SIGNIFICANCE GATE (Sep 28 2026, chat-requested) ──────────────────────
-# Extra filter on top of whichever mode above is active (payout-ratio or
-# max-win-probability) — NOT a way to exceed either one's guarantees. Only
-# lets signal 1 fire when a chi-square test says the observed hot/cold gap
-# is unlikely (p < DONKEY_SIGNIFICANCE_ALPHA) to be pure chance, using the
-# same exact test _digit_hybrid_check() elsewhere in this file already
-# uses. This is a noise filter, not an edge detector: on a genuinely fair
-# digit stream (which these synthetic indices are built to be) it can
-# ONLY reduce trade frequency, never raise the realised win rate above
-# what DONKEY_MIN_WIN_PROB / DONKEY_MIN_PAYOUT_RATIO already guarantee by
-# construction. Simulated: alpha=0.01 cuts trade frequency ~63% and
-# leaves win rate exactly where it was without this gate (0.2817 vs
-# 0.2817, 4M synthetic ticks) — confirming there's no hidden edge for it
-# to surface, only weaker reads for it to filter out.
-DONKEY_SIGNIFICANCE_ENABLED = True
-DONKEY_SIGNIFICANCE_ALPHA   = 0.01   # require p < this to trade at all;
-                                      # lower (e.g. 0.001) = rarer, more
-                                      # demanding; higher (e.g. 0.05) =
-                                      # more frequent, less demanding
+# Everything below applies the switch - no need to edit.
+REDEPLOY_INTERVAL_SECONDS = float(AUTO_REDEPLOY_SECONDS) if AUTO_REDEPLOY_ENABLED else 0.0
+# (The 7-minute cycle is always on; REDEPLOY_INTERVAL_SECONDS=0 in the Render env is the only way to stop it.)
+_ri_env = (os.environ.get("REDEPLOY_INTERVAL_SECONDS") or "").strip()
+if _ri_env:                               # an explicit env value always wins (0 = off)
+    try:
+        REDEPLOY_INTERVAL_SECONDS = float(_ri_env)
+    except ValueError:
+        pass
+REDEPLOY_INTERVAL_HOURS = REDEPLOY_INTERVAL_SECONDS / 3600.0
+if REDEPLOY_INTERVAL_SECONDS > 0:
+    TRADE_WINDOW_ENABLED = False          # a timed redeploy replaces the hourly window
+STATS_PERSIST_TO_RENDER = os.environ.get(
+    "STATS_PERSIST_TO_RENDER",
+    "0" if MH_MODE else ("1" if REDEPLOY_INTERVAL_SECONDS > 0 else "0")).strip().lower() in ("1", "true", "yes", "on")
 
-# ── DONKEY PAYOUT-RATIO MODE (Sep 28 2026, chat-requested) ──────────────
-# Supersedes DONKEY_WIDEST_ZONE / DONKEY_MIN_WIN_PROB above whenever set
-# (>0) — this is now the primary knob. Request was: win rate as low as
-# ~30% is fine, but every trade must pay out AT LEAST this many times the
-# stake, AND win rate should be the highest possible subject to that.
-#
-# Deriv fair-prices Over/Under payout as payout_ratio = (1-P)/P, so a
-# payout floor is exactly a win-probability CEILING: P_max = 1/(1+ratio).
-# For ratio=2.0 that's P_max = 1/3 -> the nearest barrier at-or-under that
-# ceiling is P=0.30 (OVER 6 / UNDER 3, payout ~2.33x stake) — the highest
-# win rate obtainable without breaking the 2x payout promise. Both Donkey
-# signals now solve for that same barrier (see signal_engine.py's
-# _donkey_payout_target_barrier() / _donkey_trend_barrier()); a tick whose
-# hot/cold read can't reach a barrier satisfying BOTH the payout floor and
-# the contrarian constraint is skipped rather than taking a trade that
-# breaks the payout guarantee — so this also throttles trade frequency
-# versus the old always-fires behavior (simulated: ~27% of ticks, 28.4%
-# empirical win rate, ~2.5x realised payout ratio, on 4M synthetic ticks).
-#
-# Set to 0 or None to go back to the win-rate-maximizing mode above
-# (DONKEY_WIDEST_ZONE / DONKEY_MIN_WIN_PROB) with no payout floor at all.
-DONKEY_MIN_PAYOUT_RATIO = 2.0   # ON again (Sep 28 2026, chat-requested:
-                                # highest win rate achievable while payout
-                                # stays > 2x stake). Overrides
-                                # DONKEY_MIN_WIN_PROB/DONKEY_WIDEST_ZONE
-                                # above entirely while set > 0 — see the
-                                # PAYOUT-RATIO MODE block below for the
-                                # math. Max win rate achievable under a 2x
-                                # payout floor is 1/3 (33%); can't be
-                                # pushed higher without lowering this.
+if AUTO_REDEPLOY_ENABLED and "REDEPLOY_DRAIN" not in os.environ:
+    REDEPLOY_DRAIN = 1                    # the cycle must drain open contracts before redeploying (explicit env still wins)
 
-# ── Donkey guard (donkey_guard.py) — LIMITS losses, does not create edge ──
-# Stops are in units of your fixed stake, so they scale with MANUAL_STAKE_AMOUNT.
-# State is saved at the end of every leg (fixed_cycle.enter_cooldown_now) so
-# it survives the redeploy between legs.
-DONKEY_GUARD_ENABLED                     = False  # REMOVED PER REQUEST - pauses/suspensions off
-# Sep 2026: thresholds now come from balance_tiers.py by stake/account range
-# (stop-loss 9 -> 5 stakes, loss streak 7 -> 5). The flat values below are
-# only the fallback when DONKEY_GUARD_TIERED = False. Take-profit is handled
-# by PROFIT_PAUSE (donkey_guard ignores its own TP while that is enabled).
-DONKEY_GUARD_TIERED                      = True
-DONKEY_GUARD_SESSION_STOP_LOSS_STAKES    = 15   # halt after net -15 stakes
-DONKEY_GUARD_SESSION_TAKE_PROFIT_STAKES  = 10   # halt after net +10 stakes
-DONKEY_GUARD_HALT_MINS                   = 120  # fallback only (used if the MIN/MAX pair below is removed)
-# Oct 2026: guard pauses now random, closer to the 11-18 min profit pause.
-DONKEY_GUARD_HALT_MIN_MINS               = 30   # session stop-loss halt: random 30-45 min (was fixed 120)
-DONKEY_GUARD_HALT_MAX_MINS               = 45
-DONKEY_GUARD_CONSEC_LOSS_LIMIT           = 8    # losses in a row before pausing
-DONKEY_GUARD_CONSEC_LOSS_PAUSE_MINS      = 30   # fallback only
-DONKEY_GUARD_CONSEC_LOSS_PAUSE_MIN_MINS  = 11   # loss-streak pause: random 11-18 min (was fixed 30)
-DONKEY_GUARD_CONSEC_LOSS_PAUSE_MAX_MINS  = 18
-DONKEY_GUARD_MAX_TRADES_PER_HOUR         = 60   # 0 disables the cap
+# ─── Redeploy cycle safety (restart_scheduler.py / redeploy_guard.py) ─────────────────────────────
+# Deploys are ALWAYS requested with clearCache="do_not_clear" (latest commit); nothing in this path clears the cache.
+REDEPLOY_BUY_BLOCK_SECONDS     = _env_f("REDEPLOY_BUY_BLOCK_SECONDS", 20)      # no new buys in the last N s before a redeploy
+REDEPLOY_HEALTH_TIMEOUT_SECONDS = _env_f("REDEPLOY_HEALTH_TIMEOUT_SECONDS", 180)  # new deploy must be live within this
+REDEPLOY_BACKOFF_BASE_SECONDS  = _env_f("REDEPLOY_BACKOFF_BASE_SECONDS", 60)   # after a failed deploy: base * 2^(fails-1)
+REDEPLOY_BACKOFF_MAX_SECONDS   = _env_f("REDEPLOY_BACKOFF_MAX_SECONDS", 1800)
+REDEPLOY_MIN_UPTIME_SECONDS    = _env_f("REDEPLOY_MIN_UPTIME_SECONDS", 120)    # never redeploy an instance younger than this
 
+# ─── TEST MODE: pre-registered, frozen experiment (exp_mode.py) ──────────────────────────────────
+# Primary test: all non-blocklisted symbols, h=1, OVER5 / UNDER4, fixed zone threshold, flat stake, demo only.
+# Everything below is part of the FROZEN CONFIG whose hash is logged at start and in every report.
+TEST_MODE             = _env_b("TEST_MODE", 0)                  # default OFF
+TEST_STAKE            = _env_f("TEST_STAKE", 1.0)               # one fixed flat stake
+TEST_ZONE_THRESHOLD   = _env_f("TEST_ZONE_THRESHOLD", 0.45)     # fire only if a zone's CALIBRATED total >= this (fixed in advance)
+TEST_MAX_OPEN         = _env_i("TEST_MAX_OPEN", 20)             # cap on open contracts (both arms)
+TEST_MAX_TRADES       = _env_i("TEST_MAX_TRADES", 4000)         # pre-set stopping rule (settled + open test-arm trades)
+TEST_APPLY_GATE       = _env_b("TEST_APPLY_GATE", 0)            # 1 = also require the per-symbol significance gate to fire
+TEST_GATE_Z           = _env_f("TEST_GATE_Z", 2.58)             # gate z in test mode (only used if TEST_APPLY_GATE=1)
+TEST_HONOUR_MUTE      = _env_b("TEST_HONOUR_MUTE", 1)           # breaker-muted symbols do not fire
+TEST_CONTROL          = _env_b("TEST_CONTROL", 1)               # control arm on
+TEST_CONTROL_MODE     = os.environ.get("TEST_CONTROL_MODE", "random").strip().lower()   # random | over | under
+TEST_CONTROL_SEED     = _env_i("TEST_CONTROL_SEED", 12345)
+TEST_VERDICT_MIN      = _env_i("TEST_VERDICT_MIN", 500)         # fewer signals -> "not enough data"
+TEST_SPRT             = _env_b("TEST_SPRT", 0)                  # sequential early stopping, OFF unless enabled
+TEST_SPRT_P1          = _env_f("TEST_SPRT_P1", 0.45)            # alternative hit rate (null = true base rate 0.40)
+TEST_SPRT_ALPHA       = _env_f("TEST_SPRT_ALPHA", 0.05)
+TEST_SPRT_BETA        = _env_f("TEST_SPRT_BETA", 0.20)
+TEST_RESCORE_HMAX     = _env_i("TEST_RESCORE_HMAX", 5)          # horizons stored per signal for re-scoring late trades
+TEST_EPOCH_DUP_MAX    = _env_f("TEST_EPOCH_DUP_MAX", 0.005)     # epoch-resolution flag: duplicate-epoch tick share
+TEST_DIAG_BLOCK       = _env_i("TEST_DIAG_BLOCK", 1000)         # digits per diagnostics block
+LEDGER_LOG_ALL_TICKS  = _env_b("LEDGER_LOG_ALL_TICKS", 1)       # 1 = every tick's prediction + outcome (large!); 0 = fired only
+LEDGER_PATH           = os.environ.get("LEDGER_PATH", "")       # SQLite file when DATABASE_URL is not set
+MH_MUTE_TTL_SECONDS   = _env_f("MH_MUTE_TTL_SECONDS", 0)        # 0 = a breaker mute never expires (restored from the ledger)
+MH_DEADLINE_RTT       = os.environ.get("MH_DEADLINE_RTT", "p50").strip().lower()   # rtt used by the deadline gate: p50 | p95 | ewma
 
-# ════════════════════════════════════════════════════════════════════════
-# SCOUT + FOLLOWER (Oct 2026, handoff_prompt_scout_follower.md)
-# ════════════════════════════════════════════════════════════════════════
-# Everything below is OFF by default: with SCOUT_FOLLOWER_ENABLED = False the
-# bot behaves exactly as before. Tokens come from env vars only:
-#   DERIV_SCOUT_TOKEN    (falls back to DERIV_API_TOKEN) — the Scout, demo
-#   DERIV_FOLLOWER_TOKEN                                 — the Follower
-SCOUT_FOLLOWER_ENABLED = os.environ.get("SCOUT_FOLLOWER_ENABLED", "0").strip() in ("1", "true", "True")
-
-# Scout = the existing engine, kept trading so the gate always has fresh
-# evidence. In data mode the Scout's profit pause, loss-streak/stop-loss
-# guard pauses and the 4-loss global pause are OFF. Kept as safety nets:
-# the daily loss limit and an hourly entry cap (below).
-SCOUT_DATA_MODE            = True
-SCOUT_MAX_TRADES_PER_HOUR  = 400
-
-# Payout multiple (stake 100 -> returns 212). NEVER hard-coded elsewhere.
-# Break-even win rate = 1 / payout. Where the real per-contract payout is
-# known (from settled wins) the gate uses that instead.
-EDGE_PAYOUT_MULTIPLE       = 2.12
-
-# ── Edge gate (rule-based, no ML) ───────────────────────────────────────
-EDGE_GATE_WINDOW           = 50     # last N confirmed Scout results (sweep: 50 beats 30)
-EDGE_GATE_MIN_TRADES       = 10     # handoff reply: 10 (was 40 in the brief)
-EDGE_GATE_MARGIN           = 0.02   # required edge over break-even
-EDGE_GATE_OPEN_PROB        = 0.97   # was 0.90 in the brief. With min_trades=10, 0.90 opened on a
-                                    # NO-edge 47% stream in 85% of 300-trade runs; 0.97 -> 29%.
-EDGE_GATE_CLOSE_PROB       = 0.60   # close when it falls below this
-EDGE_GATE_CLOSE_LOSS_RUN   = 5      # ...or the last K results are all losses
-EDGE_GATE_MIN_OPEN_SECS    = 180    # hysteresis: stay open at least this long
-EDGE_GATE_MIN_CLOSED_SECS  = 180    # ...and stay closed at least this long
-EDGE_GATE_DECAY_HALFLIFE   = 0      # trades; 0 = no time decay
-EDGE_GATE_PRIOR_STRENGTH   = 2.0    # Beta prior pseudo-trades, centred on break-even
-
-# ── Follower ────────────────────────────────────────────────────────────
-# shadow = log what it WOULD trade, place nothing (default)
-# demo   = place on the Follower demo token, virtual balance
-# live   = real token, REAL balance. Refuses to start unless
-#          FOLLOWER_LIVE_CONFIRM == "I_UNDERSTAND_REAL_MONEY". Not for this phase.
-FOLLOWER_MODE              = os.environ.get("FOLLOWER_MODE", "shadow").strip().lower()
-FOLLOWER_LIVE_CONFIRM      = os.environ.get("FOLLOWER_LIVE_CONFIRM", "")
-FOLLOWER_START_BALANCE     = float(os.environ.get("FOLLOWER_START_BALANCE", "2.08"))
-FOLLOWER_MAX_OPEN          = 3      # concurrent open follower contracts
-FOLLOWER_MAX_EXPOSURE_PCT  = 0.10   # open stakes <= this share of virtual balance
-FOLLOWER_MAX_TRADES_PER_HOUR = 60
-FOLLOWER_MAX_ENTRY_AGE_SECS  = 8    # skip an entry event older than this
-
-# ── Reporting ───────────────────────────────────────────────────────────
-SF_REPORT_EVERY_SECS       = 120
-SF_EVENTS_FILE             = "sf_events.jsonl"    # append-only settled events
-SF_SUMMARY_FILE            = "sf_summary.json"
-
-
-# ── Oct 2026: strict redeploy handoff ───────────────────────────────────
-# After the deploy hook fires, the old instance takes no new entries (so the old
-# and new instance never trade the same token at once). If the new deploy has not
-# replaced it within this many seconds, it resumes trading.
-REDEPLOY_HANDOFF_PAUSE     = True
-REDEPLOY_HANDOFF_MAX_SECS  = 240
-
-# ── Nov 2026: redeploy = disconnect from Deriv -> restart -> clear-cache deploy ──
-# (restart_scheduler.run_redeploy_sequence). Needs RENDER_API_KEY +
-# RENDER_SERVICE_ID; without them it falls back to the plain deploy hook.
-REDEPLOY_USE_API_SEQUENCE    = True    # False = old behaviour (plain deploy hook only)
-REDEPLOY_DO_RESTART          = True    # POST /restart before the deploy
-REDEPLOY_CLEAR_CACHE         = True    # deploy with clearCache="clear"
-REDEPLOY_HOLD_SECS           = 900     # restarted instance stays off Deriv this long, waiting for the new build
-REDEPLOY_SIGTERM_GRACE_SECS  = 25      # keep < Render's 30 s shutdown delay
-REDEPLOY_API_RETRIES         = 4
-REDEPLOY_REPLACE_TIMEOUT_SECS = 1200   # no replacement instance by then -> exit so Render restarts us
-REDEPLOY_EXIT_ON_FAILURE     = True    # every deploy path failed -> exit so Render restarts the service
-
-# ── Oct 2026: regime gate (replaces the slow Beta edge gate) ────────────
-GATE_MODE                  = os.environ.get("GATE_MODE", "regime")   # "regime" | "edge"
-REGIME_FAST                = 6      # results in the fast window
-REGIME_SLOW                = 12     # results in the slow window
-REGIME_ENTRY_WINS          = 4      # wins needed in the fast window to go HOT
-REGIME_ENTRY_WR_SLOW       = 0.55   # and slow-window win rate at least this
-REGIME_EXIT_LOSS_RUN       = 2      # go COLD after this many straight losses
-REGIME_EXIT_WINS           = 3      # ...or when fast-window wins fall to this
-REGIME_EXIT_DD_R           = 2.0    # ...or equity falls this many R below its peak
-REGIME_WARMUP              = 12     # results needed before the first HOT
-REGIME_MIN_CLOSED_RESULTS  = 2      # results to wait after a close (anti-whipsaw)
-REGIME_STALE_SECS          = 150    # no Scout result this long -> COLD
-REGIME_RELOAD_MAX_GAP_SECS = 300    # restored OPEN gate older than this -> COLD
-REGIME_SETTLE_LAG          = 1      # tuner: entries are placed before the last N settles
-REGIME_EDGE_BRAKE          = True   # follower stands aside while the tuner says no_edge
-
-# ── Oct 2026: ML (online learner + auto-tuner) ──────────────────────────
-ML_ENABLED                 = True
-ML_FILTER_ENABLED          = True   # learner may veto weak entries (only once trained AND useful)
-ML_FILTER_MARGIN           = 0.0
-ML_MIN_SAMPLES             = 150
-ML_USEFUL_MIN_SCORED       = 150
-ML_MIN_LOGLOSS_GAIN        = 0.002
-ML_MIN_LIFT                = 0.03
-ML_LR                      = 0.01   # swept on simulated data: higher rates were WORSE than baseline (SGD noise)
-ML_LR_MIN                  = 0.003
-ML_L2                      = 0.002
-ML_ENTITY_ALPHA            = 0.08
-ML_TUNER_ENABLED           = True
-ML_TUNE_EVERY              = 40     # new Scout results between tuning runs (was 60)
-ML_TUNE_MIN_RESULTS        = 100
-ML_TUNE_MIN_TAKEN          = 20
-ML_TUNE_MIN_GAIN_R         = 1.0
-ML_TUNE_FLIP_PENALTY       = 0.1
-ML_NO_EDGE_MIN_TAKEN       = 20
-
-# ── Oct 2026: HMM regime engine (fast, time-aware hot/cold tracking) ────────
-# "hmm"   = Bayesian two-state tracker: P(hot) updated per result, decayed by elapsed time,
-#           p_hot / p_cold / session length fitted by maximum likelihood, trades only while the
-#           forecast win probability beats payout breakeven by a margin.
-# "rules" = the previous counting rules (REGIME_* above). Set REGIME_ENGINE=rules to roll back.
-REGIME_ENGINE              = os.environ.get("REGIME_ENGINE", "hmm")
-HMM_ENTER_MARGIN           = 0.03   # open when forecast win prob >= breakeven + this (tuner moves it)
-HMM_EXIT_MARGIN            = 0.0    # close when it drops below breakeven + this (kept <= enter-0.02)
-HMM_EXIT_DD_R              = 3.0    # backstop: close if equity falls this many R from its peak
-HMM_WARMUP                 = 40     # results before the first fit
-HMM_REFIT_EVERY            = 20     # results between maximum-likelihood refits
-HMM_FIT_WINDOW             = 400    # results the fit looks at
-HMM_LR_MIN                 = 5.0    # 2*dLogLik vs "no regimes" needed to call the zig-zag real
-HMM_MIN_SEP                = 0.12   # p_hot - p_cold must be at least this
-HMM_PRIOR_HOT              = 0.62
-HMM_PRIOR_COLD             = 0.36
-HMM_STALE_SECS             = 150
-
+if TEST_MODE:
+    MH_MODE = True                        # test mode lives in the MH engine
