@@ -145,7 +145,6 @@ import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 import config
-import target_guard
 
 # Deriv's newer Options trading API (REST for account/OTP setup, WS for trading).
 # Replaces the legacy wss://ws.derivws.com/websockets/v3?app_id=... endpoint,
@@ -1310,10 +1309,6 @@ class DerivClient:
             if elapsed < 3.0:
                 await asyncio.sleep(3.0 - elapsed)
             self._last_buy_time = time.time()
-            # Balance-target guard: once TARGET_BALANCE is hit nothing may be priced or bought.
-            if target_guard.is_reached():
-                logger.warning("TARGET REACHED: order not sent - trading stopped")
-                return None
 
             contract_type = "CALL" if direction == "LONG" else "PUT"
 
@@ -1527,10 +1522,6 @@ class DerivClient:
             if elapsed < 3.0:
                 await asyncio.sleep(3.0 - elapsed)
             self._last_buy_time = time.time()
-            # Balance-target guard: once TARGET_BALANCE is hit nothing may be priced or bought.
-            if target_guard.is_reached():
-                logger.warning("TARGET REACHED: order not sent - trading stopped")
-                return None
 
             stake = self._cap_stake(stake, symbol)
             # Re-validate after capping — _cap_stake() can only raise a
@@ -1803,10 +1794,6 @@ class DerivClient:
             if elapsed < 3.0:
                 await asyncio.sleep(3.0 - elapsed)
             self._last_buy_time = time.time()
-            # Balance-target guard: once TARGET_BALANCE is hit nothing may be priced or bought.
-            if target_guard.is_reached():
-                logger.warning("TARGET REACHED: order not sent - trading stopped")
-                return None
 
             if not (1 <= growth_rate <= 5):
                 logger.error(
@@ -2116,10 +2103,6 @@ class DerivClient:
             if elapsed < 3.0:
                 await asyncio.sleep(3.0 - elapsed)
             self._last_buy_time = time.time()
-            # Balance-target guard: once TARGET_BALANCE is hit nothing may be priced or bought.
-            if target_guard.is_reached():
-                logger.warning("TARGET REACHED: order not sent - trading stopped")
-                return None
 
             if contract_type is None:
                 logger.error(

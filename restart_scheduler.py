@@ -313,10 +313,6 @@ def run_redeploy_sequence(reason: str = "scheduled", exit_on_failure: bool = Non
     """Blocking. Safe to call from any thread. Returns True once the deploy has
     been accepted by Render. Deriv must already be disconnected by the caller."""
     global _sequence_state
-    import target_guard
-    if target_guard.is_reached():      # balance target hit: the service is being suspended
-        logger.warning("REDEPLOY SEQUENCE: skipped - balance target reached, service is suspending")
-        return True
     with _sequence_lock:
         if _sequence_state == "running":
             logger.warning("REDEPLOY SEQUENCE: already running — ignoring duplicate trigger")

@@ -57,7 +57,6 @@ import symbols as sym_module
 import strategy_stats
 import meta_labeling
 import pair_suspension
-import target_guard
 from deriv_client import DerivClient
 from candlestick_builder import CandlestickBuilder
 from smc_analyzer import SMCAnalyzer, SMCContext
@@ -301,22 +300,6 @@ class _StrategyExpectancyTracker:
 
 
 # ─── Bot engine ────────────────────────────────────────────────────────────────
-
-def _flip_digit_trade(match_type, digit):
-    """FLIP_TRADES mirror image of an OVER/UNDER digit trade, or None if it can't be
-    flipped. OVER b wins on digits b+1..9 (9-b of them); UNDER (9-b) wins on digits
-    0..8-b (also 9-b of them), so win probability and payout are unchanged."""
-    try:
-        d = int(digit)
-    except (TypeError, ValueError):
-        return None
-    mt = str(match_type or "").upper()
-    if mt == "OVER" and 0 <= d <= 8:
-        return "UNDER", 9 - d
-    if mt == "UNDER" and 1 <= d <= 9:
-        return "OVER", 9 - d
-    return None
-
 
 class BotEngine:
 
@@ -588,8 +571,6 @@ class BotEngine:
 
     def _on_balance(self, balance: float):
         self.risk.set_balance(balance)
-        # Balance target: at/above TARGET_BALANCE -> no more trades, service suspended.
-        target_guard.check_balance(balance)
         # No balance-driven cycle logic anymore — fixed_cycle.py's
         # single-leg-then-cooldown pattern is purely time-based (see
         # _settle_loop's redeploy-pending handling), not balance-,
@@ -617,19 +598,6 @@ class BotEngine:
 
         self.client.on_balance(self._on_balance)
         self.risk.set_balance(self.client.balance)
-
-        # ── Balance-target guard (TARGET_BALANCE), checked at every boot ──────
-        if target_guard.target() is None:
-            logger.info("TARGET GUARD: TARGET_BALANCE not set - no balance target")
-        else:
-            logger.info("TARGET GUARD: target=%.2f  live balance=%.2f",
-                        target_guard.target(), self.client.balance)
-            target_guard.check_balance(self.client.balance)
-            if target_guard.is_reached():
-                logger.warning("TARGET GUARD: balance already at/above target - "
-                               "not trading; the service is being suspended")
-                ws_task.cancel()
-                return
 
         self._day_start_balance     = self.client.balance
         self._session_start_balance = self.client.balance
@@ -683,7 +651,6 @@ class BotEngine:
         dash_task     = asyncio.create_task(self._dashboard_loop())
         settle_task   = asyncio.create_task(self._settle_loop())
         degraded_task = asyncio.create_task(self._degraded_retry_loop())
-        target_task   = asyncio.create_task(self._target_monitor_loop())
         # NOTE: the daily Kenya-midnight redeploy timer (Fix G) is started
         # by main.py's existing restart_scheduler.start_restart_scheduler()
         # call, unchanged — NOT started again here, to avoid two competing
@@ -703,24 +670,7 @@ class BotEngine:
             dash_task.cancel()
             settle_task.cancel()
             degraded_task.cancel()
-            target_task.cancel()
             ws_task.cancel()
-
-    async def _target_monitor_loop(self):
-        """Safety net beside the balance stream: poll Deriv's live balance directly
-        every TARGET_CHECK_SECONDS and stop as soon as it is at/above the target."""
-        while not target_guard.is_reached():
-            await asyncio.sleep(target_guard.check_seconds())
-            if target_guard.target() is None or not self.client.is_connected:
-                continue
-            try:
-                resp = await self.client._send({"balance": 1}, timeout=10)
-                bal = float(resp.get("balance", {}).get("balance", self.client.balance))
-                target_guard.check_balance(bal)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.debug("target monitor: balance poll failed: %s", exc)
 
     # ── Deliberate disconnect ahead of restart + clear-cache redeploy ──────────
 
@@ -1412,8 +1362,7 @@ class BotEngine:
                 in_loss_streak_pause = True
 
             top: List[ScanResult] = []
-            if (available_slots > 0 and not self._confirmed_paused and not in_loss_streak_pause
-                    and not target_guard.is_reached()):
+            if available_slots > 0 and not self._confirmed_paused and not in_loss_streak_pause:
                 for r in ranked:
                     if len(top) >= available_slots:
                         break
@@ -2238,22 +2187,6 @@ class BotEngine:
         if getattr(sig, "contract_kind", "RISE_FALL") == "DIGIT":
             digit = getattr(sig, "digit", None)
             match_type = getattr(sig, "match_type", None)
-            # FLIP_TRADES: take the mirror-image side (same win probability and
-            # payout). The signal itself is updated so every record downstream
-            # (open-contract log, results) matches what was actually bought.
-            if (getattr(config, "FLIP_TRADES", False)
-                    and not getattr(sig, "_flipped", False)):
-                _flip = _flip_digit_trade(match_type, digit)
-                if _flip is not None:
-                    logger.warning(
-                        f"FLIP TRADES: {symbol} {match_type} {digit} -> "
-                        f"{_flip[0]} {_flip[1]}")
-                    match_type, digit = _flip
-                    sig.match_type, sig.digit = match_type, digit
-                    sig._flipped = True
-                else:
-                    logger.info(f"FLIP TRADES: {symbol} {match_type} {digit} "
-                                f"cannot be mirrored - placed as-is")
             if digit is None or match_type is None:
                 logger.warning(
                     f"PLACEMENT SKIPPED: {symbol} DIGIT signal missing "
@@ -2659,7 +2592,6 @@ class BotEngine:
             self._global_consecutive_losses += 1
             limit = getattr(config, "GLOBAL_CONSECUTIVE_LOSS_LIMIT", 4)
             if (self._global_consecutive_losses >= limit
-                    and getattr(config, "GLOBAL_CONSECUTIVE_LOSS_PAUSE_MINS", 45) > 0
                     and not _sf.scout_data_mode()):
                 pause_mins = getattr(config, "GLOBAL_CONSECUTIVE_LOSS_PAUSE_MINS", 45)
                 self._loss_streak_paused_until = time.time() + pause_mins * 60

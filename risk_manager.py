@@ -535,8 +535,6 @@ class RiskManager:
         next trade on this (strategy, symbol) pair, PLS + Kelly overlay
         combined, using the current cached balance.
         """
-        if getattr(config, "STAKE_AMOUNT", None):
-            return float(config.STAKE_AMOUNT)
         if getattr(config, "BALANCE_TIER_STAKE_MODE", False):
             import balance_tiers
             return balance_tiers.stake_for_balance(self._current_balance)
@@ -570,23 +568,6 @@ class RiskManager:
         # the balance band table in balance_tiers.py, replacing the fixed
         # MANUAL_STAKE_AMOUNT. Checked first; set BALANCE_TIER_STAKE_MODE =
         # False in config.py to fall back to the manual/dynamic paths below.
-        # STAKE_AMOUNT / PREDICTOR_STAKE env var: fixed stake, overrides the tier table.
-        if getattr(config, "STAKE_AMOUNT", None):
-            await self._fetch_live_balance()
-            stake   = float(config.STAKE_AMOUNT)
-            ceiling = self._current_balance * getattr(config, "EXPOSURE_CEILING_PCT", 0.90)
-            room    = ceiling - self._committed_exposure()
-            if room < stake:
-                logger.info(
-                    f"STAKE: $0.00 — env stake ${stake:g} exceeds remaining "
-                    f"exposure room ${max(room, 0):.2f}")
-                return 0.0
-            logger.info(
-                f"STAKE: ${stake:g} — fixed by STAKE_AMOUNT env var "
-                f"(balance ${self._current_balance:,.2f})"
-                + (f" strategy={strategy} symbol={symbol}" if strategy and symbol else ""))
-            return stake
-
         if getattr(config, "BALANCE_TIER_STAKE_MODE", False):
             import balance_tiers
             await self._fetch_live_balance()

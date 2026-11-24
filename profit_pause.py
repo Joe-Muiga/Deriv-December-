@@ -51,8 +51,6 @@ def on_boot(balance: float) -> float:
     starts a fresh session at `balance`."""
     global _start_balance, _fired
     _fired = False
-    if not _enabled():          # profit pause removed: no session tracking, no env-var writes
-        return float(balance)
     try:
         saved = float(os.environ.get(ENV_KEY, "0") or 0)
     except ValueError:
